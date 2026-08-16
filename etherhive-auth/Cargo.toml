@@ -1,0 +1,30 @@
+[package]
+name = "etherhive-auth"
+version = "0.1.0"
+edition = "2021"
+description = "Wallet + ENS identity for EtherHive. Arnacon-compatible by construction: sign UUID+timestamp, verify against the current ENS owner."
+
+[dependencies]
+# secp256k1 identity keys, signing, ENS ownership resolution, EIP-191/SIWE.
+# alloy-signer-local wraps k256 internally — one secp256k1 stack shared with
+# the RPC/contract layer instead of maintaining two that must agree bit-for-bit.
+alloy = { version = "2.4.1", features = ["provider-http", "signer-mnemonic", "signer-keystore", "ens"] }
+alloy-ens = "2.4.1"
+siwe = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+time = { version = "0.3", features = ["formatting"] }
+http = "1"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+# anvil-api: only needed by the anvil-fork integration tests (impersonation
+# cheat codes), not production code — kept out of [dependencies].
+alloy = { version = "2.4.1", features = ["provider-anvil-api"] }

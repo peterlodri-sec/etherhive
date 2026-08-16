@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
 use zeroize::Zeroize;
 
+use crate::pqc::DilithiumKeypair;
+
 /// Honesty Auth — identity through personality, not passwords.
 /// The honesty vector is a set of deeply personal answers that only
 /// the real person can answer consistently over time.
@@ -64,10 +66,13 @@ impl HonestyVector {
         hex::encode(hasher.finalize())
     }
 
-    /// Compute full hash
+    /// Compute full hash — covers `version` too, not just `fields`, so a
+    /// signature over this hash (see `sign`/`verify_signature`) can't be
+    /// replayed against a vector with the version silently changed.
     pub fn full_hash(&self) -> String {
         let json = serde_json::to_string(&self.fields).unwrap_or_default();
         let mut hasher = Sha256::new();
+        hasher.update(self.version.to_le_bytes());
         hasher.update(json.as_bytes());
         hex::encode(hasher.finalize())
     }
@@ -131,6 +136,23 @@ impl HonestyVector {
             self.fields.poem, self.fields.poet
         )
     }
+
+    /// Sign this vector's field hash with an ML-DSA (Dilithium) keypair —
+    /// fills `sig`. Ties the honesty vector to the same identity key used
+    /// for the phase-0 PQC bundle, so a stolen vector alone can't be replayed
+    /// under someone else's key.
+    pub fn sign(&mut self, keypair: &DilithiumKeypair) {
+        let signature = keypair.sign(self.full_hash().as_bytes());
+        self.sig = Some(hex::encode(signature));
+    }
+
+    /// Verify the stored signature against `public_key`. `false` if unsigned,
+    /// undecodable, or the signature doesn't verify.
+    pub fn verify_signature(&self, public_key: &[u8]) -> bool {
+        let Some(sig_hex) = &self.sig else { return false };
+        let Ok(sig_bytes) = hex::decode(sig_hex) else { return false };
+        DilithiumKeypair::verify(public_key, self.full_hash().as_bytes(), &sig_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +209,41 @@ mod tests {
         let v1 = sample_vector();
         let v2 = sample_vector();
         assert_eq!(v1.core_hash(), v2.core_hash());
+    }
+
+    #[test]
+    fn test_sign_and_verify_signature() {
+        let keypair = DilithiumKeypair::generate();
+        let mut v = sample_vector();
+        assert!(v.sig.is_none());
+
+        v.sign(&keypair);
+        assert!(v.sig.is_some());
+        assert!(v.verify_signature(keypair.public_key()));
+    }
+
+    #[test]
+    fn test_verify_signature_rejects_wrong_key() {
+        let keypair = DilithiumKeypair::generate();
+        let other_keypair = DilithiumKeypair::generate();
+        let mut v = sample_vector();
+        v.sign(&keypair);
+        assert!(!v.verify_signature(other_keypair.public_key()));
+    }
+
+    #[test]
+    fn test_verify_signature_rejects_tampered_fields() {
+        let keypair = DilithiumKeypair::generate();
+        let mut v = sample_vector();
+        v.sign(&keypair);
+        v.fields.song = "tampered".into();
+        assert!(!v.verify_signature(keypair.public_key()));
+    }
+
+    #[test]
+    fn test_verify_signature_false_when_unsigned() {
+        let v = sample_vector();
+        let keypair = DilithiumKeypair::generate();
+        assert!(!v.verify_signature(keypair.public_key()));
     }
 }
