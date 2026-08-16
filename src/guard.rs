@@ -10,7 +10,7 @@ pub fn disallow_debugging() {
         let result = unsafe { libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) };
         if result != 0 {
             // Already being traced — refuse to run
-            eprintln!("honest-irc: debugger detected. refusing to run.");
+            eprintln!("etherhive: debugger detected. refusing to run.");
             std::process::abort();
         }
     }
@@ -30,9 +30,9 @@ pub fn disallow_debugging() {
 pub fn verify_integrity(expected_hash: &str) {
     // In production: compute hash of .text section and compare
     // For now: check against BUILD_HASH env var
-    if let Ok(actual) = std::env::var("HONEST_IRC_BUILD_HASH") {
+    if let Ok(actual) = std::env::var("ETHERHIVE_BUILD_HASH") {
         if actual != expected_hash {
-            eprintln!("honest-irc: integrity check failed. binary may be tampered.");
+            eprintln!("etherhive: integrity check failed. binary may be tampered.");
             std::process::abort();
         }
     }

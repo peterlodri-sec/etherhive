@@ -1,110 +1,120 @@
 /// Post-Quantum Cryptography module.
 ///
-/// Placeholder implementations for CRYSTALS-Kyber (ML-KEM-1024),
-/// CRYSTALS-Dilithium (ML-DSA-87), and SPHINCS+ (SLH-DSA-SHAKE-256s).
-///
-/// In production: replace with pqcrypto crates when they stabilize.
-/// Currently using classical algorithms as placeholders.
+/// Real NIST-standardized implementations, backed by RustCrypto:
+/// - ML-KEM-1024 (FIPS 203, née CRYSTALS-Kyber) — key encapsulation.
+/// - ML-DSA-87 (FIPS 204, née CRYSTALS-Dilithium) — digital signatures.
+/// - SLH-DSA-SHA2-128s (FIPS 205, née SPHINCS+) — backup hash-based signatures.
 
-use rand::Rng;
+use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem1024};
+use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport as KemKeyExport, TryKeyInit};
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, Generate, Keypair, MlDsa87, Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use slh_dsa::{Sha2_128s, Signature as SlhSignature, SigningKey as SlhSigningKey, VerifyingKey as SlhVerifyingKey};
+use slh_dsa::signature::{Keypair as SlhKeypair, RandomizedSigner, Verifier as SlhVerifier};
 
 /// ML-KEM-1024 (CRYSTALS-Kyber) Key Encapsulation Mechanism.
 /// Post-quantum secure.
 pub struct KyberKeypair {
     pub public_key: Vec<u8>,
-    #[allow(dead_code)]
-    secret_key: Vec<u8>,
+    decap_key: DecapsulationKey<MlKem1024>,
 }
 
 impl KyberKeypair {
-    /// Generate a new Kyber-1024 keypair.
-    /// In production: pqcrypto_kyber::keypair()
+    /// Generate a new ML-KEM-1024 keypair.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let sk: Vec<u8> = (0..3168).map(|_| rng.gen()).collect(); // Kyber-1024 sk size
-        let pk: Vec<u8> = (0..1568).map(|_| rng.gen()).collect(); // Kyber-1024 pk size
-        KyberKeypair { public_key: pk, secret_key: sk }
+        let (decap_key, encap_key) = MlKem1024::generate_keypair();
+        KyberKeypair {
+            public_key: encap_key.to_bytes().to_vec(),
+            decap_key,
+        }
     }
 
     /// Encapsulate a shared secret using the recipient's public key.
     /// Returns (ciphertext, shared_secret).
-    pub fn encapsulate(_pk: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let mut rng = rand::thread_rng();
-        let ct: Vec<u8> = (0..1568).map(|_| rng.gen()).collect(); // Kyber-1024 ct size
-        let ss: Vec<u8> = (0..32).map(|_| rng.gen()).collect();    // 256-bit shared secret
-        (ct, ss)
+    pub fn encapsulate(pk: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let ek = EncapsulationKey::<MlKem1024>::new_from_slice(pk)
+            .expect("invalid ML-KEM-1024 public key");
+        let (ct, ss) = ek.encapsulate();
+        (ct.to_vec(), ss.to_vec())
     }
 
     /// Decapsulate a shared secret using our secret key.
-    pub fn decapsulate(&self, _ct: &[u8]) -> Vec<u8> {
-        let mut rng = rand::thread_rng();
-        (0..32).map(|_| rng.gen()).collect() // 256-bit shared secret
+    pub fn decapsulate(&self, ct: &[u8]) -> Vec<u8> {
+        self.decap_key
+            .decapsulate_slice(ct)
+            .expect("invalid ML-KEM-1024 ciphertext")
+            .to_vec()
     }
 }
 
 /// ML-DSA-87 (CRYSTALS-Dilithium) Digital Signature Algorithm.
 /// Post-quantum secure.
 pub struct DilithiumKeypair {
-    #[allow(dead_code)]
+    signing_key: SigningKey<MlDsa87>,
     public_key: Vec<u8>,
-    #[allow(dead_code)]
-    secret_key: Vec<u8>,
 }
 
 impl DilithiumKeypair {
-    /// Generate a new Dilithium-5 keypair.
+    /// Generate a new ML-DSA-87 keypair.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let sk: Vec<u8> = (0..4864).map(|_| rng.gen()).collect();  // Dilithium-5 sk size
-        let pk: Vec<u8> = (0..2592).map(|_| rng.gen()).collect();  // Dilithium-5 pk size
-        DilithiumKeypair { public_key: pk, secret_key: sk }
+        let signing_key = SigningKey::<MlDsa87>::generate();
+        let public_key = signing_key.verifying_key().encode().to_vec();
+        DilithiumKeypair { signing_key, public_key }
+    }
+
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
     }
 
     /// Sign a message.
-    pub fn sign(&self, _message: &[u8]) -> Vec<u8> {
-        let mut rng = rand::thread_rng();
-        (0..4595).map(|_| rng.gen()).collect() // Dilithium-5 sig size
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(message).encode().to_vec()
     }
 
     /// Verify a signature.
-    pub fn verify(_pk: &[u8], message: &[u8], _signature: &[u8]) -> bool {
-        // In production: pqcrypto_dilithium::verify(pk, message, signature)
-        message.len() > 0 // placeholder
+    pub fn verify(pk: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        let Ok(enc_vk) = EncodedVerifyingKey::<MlDsa87>::try_from(pk) else { return false };
+        let Ok(enc_sig) = EncodedSignature::<MlDsa87>::try_from(signature) else { return false };
+        let Some(sig) = Signature::<MlDsa87>::decode(&enc_sig) else { return false };
+        VerifyingKey::<MlDsa87>::decode(&enc_vk).verify(message, &sig).is_ok()
     }
 }
 
-/// SLH-DSA-SHAKE-256s (SPHINCS+) Stateless Hash-Based Signature.
+/// SLH-DSA-SHA2-128s (SPHINCS+) Stateless Hash-Based Signature.
 /// Backup signature scheme — purely hash-based, no lattice assumptions.
 pub struct SphincsKeypair {
-    #[allow(dead_code)]
+    signing_key: SlhSigningKey<Sha2_128s>,
     public_key: Vec<u8>,
-    #[allow(dead_code)]
-    secret_key: Vec<u8>,
 }
 
 impl SphincsKeypair {
-    /// Generate a new SPHINCS+ keypair.
+    /// Generate a new SLH-DSA-SHA2-128s keypair.
     pub fn generate() -> Self {
         let mut rng = rand::thread_rng();
-        let sk: Vec<u8> = (0..64).map(|_| rng.gen()).collect();     // SPHINCS+ sk size
-        let pk: Vec<u8> = (0..32).map(|_| rng.gen()).collect();     // SPHINCS+ pk size
-        SphincsKeypair { public_key: pk, secret_key: sk }
+        let signing_key = SlhSigningKey::<Sha2_128s>::new(&mut rng);
+        let public_key = signing_key.verifying_key().to_vec();
+        SphincsKeypair { signing_key, public_key }
+    }
+
+    pub fn public_key(&self) -> &[u8] {
+        &self.public_key
     }
 
     /// Sign a message.
-    pub fn sign(&self, _message: &[u8]) -> Vec<u8> {
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
         let mut rng = rand::thread_rng();
-        (0..7856).map(|_| rng.gen()).collect() // SLH-DSA sig size
+        self.signing_key.sign_with_rng(&mut rng, message).to_vec()
     }
 
     /// Verify a signature.
-    pub fn verify(_pk: &[u8], message: &[u8], _signature: &[u8]) -> bool {
-        message.len() > 0
+    pub fn verify(pk: &[u8], message: &[u8], signature: &[u8]) -> bool {
+        let Ok(vk) = SlhVerifyingKey::<Sha2_128s>::try_from(pk) else { return false };
+        let Ok(sig) = SlhSignature::<Sha2_128s>::try_from(signature) else { return false };
+        vk.verify(message, &sig).is_ok()
     }
 }
 
 /// Hybrid post-quantum crypto bundle.
-/// Uses Kyber for KEM + Dilithium for signatures + SPHINCS+ for backup.
+/// Uses ML-KEM for KEM + ML-DSA for signatures + SLH-DSA for backup.
 pub struct PqcBundle {
     pub kyber: KyberKeypair,
     pub dilithium: DilithiumKeypair,
@@ -128,7 +138,7 @@ mod tests {
     #[test]
     fn test_kyber_keypair_generation() {
         let kp = KyberKeypair::generate();
-        assert_eq!(kp.public_key.len(), 1568);
+        assert_eq!(kp.public_key.len(), 1568); // ML-KEM-1024 encapsulation key size
     }
 
     #[test]
@@ -136,22 +146,49 @@ mod tests {
         let kp = KyberKeypair::generate();
         let (ct, ss_enc) = KyberKeypair::encapsulate(&kp.public_key);
         let ss_dec = kp.decapsulate(&ct);
-        // In production: ss_enc == ss_dec
-        assert_eq!(ss_enc.len(), 32);
-        assert_eq!(ss_dec.len(), 32);
+        assert_eq!(ss_enc, ss_dec); // real KEM: shared secrets must match
     }
 
     #[test]
     fn test_dilithium_keypair_generation() {
         let kp = DilithiumKeypair::generate();
-        assert_eq!(kp.public_key.len(), 2592);
+        assert_eq!(kp.public_key().len(), 2592); // ML-DSA-87 public key size
+    }
+
+    #[test]
+    fn test_dilithium_sign_verify_roundtrip() {
+        let kp = DilithiumKeypair::generate();
+        let msg = b"etherhive phase 0";
+        let sig = kp.sign(msg);
+        assert!(DilithiumKeypair::verify(kp.public_key(), msg, &sig));
+    }
+
+    #[test]
+    fn test_dilithium_rejects_tampered_message() {
+        let kp = DilithiumKeypair::generate();
+        let sig = kp.sign(b"etherhive phase 0");
+        assert!(!DilithiumKeypair::verify(kp.public_key(), b"tampered", &sig));
+    }
+
+    #[test]
+    fn test_sphincs_sign_verify_roundtrip() {
+        let kp = SphincsKeypair::generate();
+        let msg = b"etherhive backup sig";
+        let sig = kp.sign(msg);
+        assert!(SphincsKeypair::verify(kp.public_key(), msg, &sig));
+    }
+
+    #[test]
+    fn test_sphincs_rejects_tampered_message() {
+        let kp = SphincsKeypair::generate();
+        let sig = kp.sign(b"etherhive backup sig");
+        assert!(!SphincsKeypair::verify(kp.public_key(), b"tampered", &sig));
     }
 
     #[test]
     fn test_pqc_bundle_generation() {
         let bundle = PqcBundle::generate();
         assert_eq!(bundle.kyber.public_key.len(), 1568);
-        assert_eq!(bundle.dilithium.public_key.len(), 2592);
-        assert_eq!(bundle.sphincs.public_key.len(), 32);
+        assert_eq!(bundle.dilithium.public_key().len(), 2592);
     }
 }

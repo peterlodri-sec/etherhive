@@ -41,7 +41,7 @@ jobs:
           echo "Date: $(date -u)" >> qve-report.txt
           echo "SHA: ${GITHUB_SHA}" >> qve-report.txt
           echo "" >> qve-report.txt
-          for bin in honest-irc honest-vpn honest-crypt honest-mesh honest-ircd; do
+          for bin in etherhive etherhive-vpn etherhive-crypt etherhive-mesh etherhive-ircd; do
             echo "Binary: $bin" >> qve-report.txt
             file target/release/$bin >> qve-report.txt 2>/dev/null || echo "  not found" >> qve-report.txt
             readelf -l target/release/$bin 2>/dev/null | grep -q "GNU_RELRO" && echo "  RELRO: YES" >> qve-report.txt || echo "  RELRO: CHECK_FAILED" >> qve-report.txt
@@ -68,7 +68,7 @@ jobs:
           echo "=== Fuzzing (1000 random messages) ===" >> qve-report.txt
           for i in $(seq 1 100); do
             PAYLOAD=$(head -c $((RANDOM % 512)) /dev/urandom 2>/dev/null | base64 2>/dev/null | tr -d '\0\n\r' | head -c 256)
-            echo "$PAYLOAD" | timeout 2 ./target/release/honest-irc connect 2>/dev/null || true
+            echo "$PAYLOAD" | timeout 2 ./target/release/etherhive connect 2>/dev/null || true
           done
           echo "  100 iterations, no crashes" >> qve-report.txt
 
@@ -76,8 +76,8 @@ jobs:
         run: |
           echo "" >> qve-report.txt
           echo "=== Anti-Debug ===" >> qve-report.txt
-          timeout 3 strace -o /dev/null ./target/release/honest-irc status 2>&1 >> qve-report.txt || echo "  strace: BLOCKED" >> qve-report.txt
-          echo "run" | timeout 3 gdb -batch ./target/release/honest-irc 2>&1 >> qve-report.txt || echo "  gdb: BLOCKED" >> qve-report.txt
+          timeout 3 strace -o /dev/null ./target/release/etherhive status 2>&1 >> qve-report.txt || echo "  strace: BLOCKED" >> qve-report.txt
+          echo "run" | timeout 3 gdb -batch ./target/release/etherhive 2>&1 >> qve-report.txt || echo "  gdb: BLOCKED" >> qve-report.txt
 
       - name: Final summary
         run: |

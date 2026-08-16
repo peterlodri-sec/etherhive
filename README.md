@@ -1,4 +1,4 @@
-# honest-irc -- quantum-proof decentralized messaging
+# etherhive -- quantum-proof decentralized messaging
 
 > auth via honesty. transport via Mullvad double-hop. crypto via Kyber+X25519.
 > memory via memfd+mlock. per-byte encryption via Quant1bitLLM seed.
@@ -6,7 +6,7 @@
 
 ```
                                                                 +=============+
-                                                                | HONEST-IRC  |
+                                                                | ETHERHIVE   |
                                                                 | DM  GROUP   |
                                                                 | /msg /room  |
                                                                 | /music /quant|
@@ -39,11 +39,11 @@
 Four sidecar binaries, chained via CLI | Unix sockets:
 
 ```
-honest-irc up
-  -> honest-vpn    (Mullvad double-hop WireGuard)
-  -> honest-crypt  (Kyber-1024 + X25519 + per-byte LLM sub-keys)
-  -> honest-mesh   (Tailscale/Headscale peer-to-peer)
-  -> honest-ircd   (IRC protocol + honesty-auth + music.vaked.dev)
+etherhive up
+  -> etherhive-vpn    (Mullvad double-hop WireGuard)
+  -> etherhive-crypt  (Kyber-1024 + X25519 + per-byte LLM sub-keys)
+  -> etherhive-mesh   (Tailscale/Headscale peer-to-peer)
+  -> etherhive-ircd   (IRC protocol + honesty-auth + music.vaked.dev)
 ```
 
 See [ARCHITECTURE.txt](ARCHITECTURE.txt) for full ASCII blueprint.
@@ -52,10 +52,10 @@ See [ARCHITECTURE.txt](ARCHITECTURE.txt) for full ASCII blueprint.
 
 ```bash
 # create your identity (17 honesty questions)
-honest-irc init
+etherhive init
 
 # start all sidecars
-honest-irc up
+etherhive up
 
 # DM someone
 /msg alice hello, quantum-proof world

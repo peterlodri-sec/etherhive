@@ -1,31 +1,31 @@
 [package]
-name = "honest-irc"
+name = "etherhive"
 version = "2.1.0"
 edition = "2021"
-description = "Quantum-proof decentralized messaging. Auth via honesty. Mesh via Tailnet. Crypto via Kyber + Dilithium."
+description = "Quantum-proof decentralized messaging. Auth via honesty. Mesh via Tailnet. Crypto via Kyber + Dilithium. One name, no phone number."
 
 [[bin]]
-name = "honest-irc"
+name = "etherhive"
 path = "src/main.rs"
 
 [[bin]]
-name = "honest-vpn"
+name = "etherhive-vpn"
 path = "src/bin/vpn.rs"
 
 [[bin]]
-name = "honest-crypt"
+name = "etherhive-crypt"
 path = "src/bin/crypt.rs"
 
 [[bin]]
-name = "honest-mesh"
+name = "etherhive-mesh"
 path = "src/bin/mesh.rs"
 
 [[bin]]
-name = "honest-ircd"
+name = "etherhive-ircd"
 path = "src/bin/ircd.rs"
 
 [[bin]]
-name = "honest-client"
+name = "etherhive-client"
 path = "src/bin/client.rs"
 
 [dependencies]
@@ -47,11 +47,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 
-# PQC algorithms — placeholder until pqcrypto crates stabilize
-# pqcrypto-kyber = "0.7"      # CRYSTALS-Kyber KEM
-# pqcrypto-dilithium = "0.5"  # CRYSTALS-Dilithium signatures
-# pqcrypto-sphincsplus = "0.3" # SPHINCS+ signatures
+# PQC algorithms — RustCrypto, NIST FIPS 203/204/205 final standards
+ml-kem = { version = "0.3.2", features = ["getrandom"] } # FIPS 203 — ML-KEM-1024 (CRYSTALS-Kyber)
+ml-dsa = "0.1.1"    # FIPS 204 — ML-DSA-87 (CRYSTALS-Dilithium)
+slh-dsa = "0.1.0"   # FIPS 205 — SLH-DSA-SHA2-128s (SPHINCS+)
+# slh-dsa 0.1.0 only compiles against signature 2.3.0-pre.4 exactly (newer
+# pre-releases renamed CryptoRngCore); pin the transitive dep to unbreak it.
+signature = "=2.3.0-pre.4"
 
-# Note: PQC crates are placeholder until pqcrypto ecosystem matures.
-# Currently using classical X25519 + ChaCha20 as the transport layer.
-# Hybrid mode (Kyber + X25519) will be added when pqcrypto crates are stable.
+# Note: transport layer is classical X25519 + ChaCha20Poly1305 (crypto.rs).
+# Hybrid mode (ML-KEM + X25519) lands in phase 2 (X3DH/PQXDH-style bootstrap).

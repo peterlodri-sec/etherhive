@@ -1,4 +1,4 @@
-use honest_irc::hardening::{sanitize_body, strip_egress};
+use etherhive::hardening::{sanitize_body, strip_egress};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 

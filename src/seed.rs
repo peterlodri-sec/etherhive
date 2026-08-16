@@ -19,7 +19,7 @@ impl QuantByteCipher {
     /// `session_key`: the Kyber+X25519 shared secret
     /// `weights`: the LLM weight activations {-1, 0, +1}^N
     pub fn new(session_key: &[u8], weights: Vec<i8>) -> Self {
-        let salt = b"honest-irc-quant1bit-llm-v1";
+        let salt = b"etherhive-quant1bit-llm-v1";
         let hk = Hkdf::<Sha256>::new(Some(salt), session_key);
         let mut prk = vec![0u8; 32];
         hk.expand(b"per-byte-subkey", &mut prk).expect("HKDF expand failed");

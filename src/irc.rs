@@ -7,6 +7,8 @@ pub enum Message {
     Text { from: String, room: String, body: String },
     /// Emote (/me)
     Emote { from: String, room: String, action: String },
+    /// Direct message to a single peer (not room-broadcast)
+    Dm { from: String, to: String, body: String },
     /// Honesty vector broadcast (signed)
     Honesty { from: String, vector: String },
     /// Challenge-verify request
@@ -112,6 +114,24 @@ pub fn encode(msg: &Message) -> String {
 
 pub fn decode(data: &str) -> Option<Message> {
     serde_json::from_str(data).ok()
+}
+
+/// Encrypt a `Message` into a wire-format `Envelope`, using the given
+/// client<->server session. This is the transport encryption used by the
+/// WebSocket ircd path — the server can still decrypt to route (that's the
+/// phase-0 bar), full multi-hop E2E lands with the phase-2 ratchet.
+pub fn encode_encrypted(msg: &Message, session: &mut CryptoSession, from: &str, seq: u64) -> String {
+    let plaintext = serde_json::to_vec(msg).unwrap_or_default();
+    let payload = session.encrypt(&plaintext);
+    let envelope = Envelope { from: from.to_string(), payload, seq };
+    serde_json::to_string(&envelope).unwrap_or_default()
+}
+
+/// Decrypt a wire-format `Envelope` back into a `Message`.
+pub fn decode_encrypted(data: &str, session: &mut CryptoSession) -> Option<Message> {
+    let envelope: Envelope = serde_json::from_str(data).ok()?;
+    let plaintext = session.decrypt(&envelope.payload)?;
+    serde_json::from_slice(&plaintext).ok()
 }
 
 #[cfg(test)]

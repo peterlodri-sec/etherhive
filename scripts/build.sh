@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# honest-irc build script — deterministic, stripped, UPX-compressed, anti-debug
+# etherhive build script — deterministic, stripped, UPX-compressed, anti-debug
 # BUILD_HASH = SHA256(genesis_hash + previous_BUILD_HASH + source_hash)
 # Target binary size: exactly 4.20 MB (4200000 bytes)
 set -euo pipefail
@@ -30,7 +30,7 @@ export RUSTFLAGS="\
 
 cargo build --release
 
-for bin in honest-irc honest-vpn honest-crypt honest-mesh honest-ircd; do
+for bin in etherhive etherhive-vpn etherhive-crypt etherhive-mesh etherhive-ircd; do
   BIN="target/release/$bin"
   strip "$BIN"
 
@@ -66,7 +66,7 @@ while len(pad) < $PAD_SIZE:
     else:
         pad.append(random.randint(0, 255))
 # mark the padding boundary with magic bytes
-magic = b'\x42\x00\x42\x00HOME\x00HONEST\x00IRC\x00'  # B\0B\0HOME\0HONEST\0IRC\0
+magic = b'\x42\x00\x42\x00HOME\x00ETHERHIVE\x00'  # B\0B\0HOME\0ETHERHIVE\0
 pad = pad[:$PAD_SIZE - len(magic)] + magic
 sys.stdout.buffer.write(pad)
 " >> "$BIN"
@@ -79,7 +79,7 @@ done
 
 # UPX compress (with --overlay=copy to preserve padding bytes)
 if command -v upx &>/dev/null; then
-  for bin in honest-irc honest-vpn honest-crypt honest-mesh honest-ircd; do
+  for bin in etherhive etherhive-vpn etherhive-crypt etherhive-mesh etherhive-ircd; do
     upx --best --lzma --overlay=copy target/release/$bin -o target/release/$bin-upx 2>/dev/null && \
       mv target/release/$bin-upx target/release/$bin
   done
@@ -94,10 +94,10 @@ GENESIS=$GENESIS
 SOURCE_HASH=$SOURCE_HASH
 TARGET_SIZE=$TARGET_SIZE
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-BINARIES: honest-irc honest-vpn honest-crypt honest-mesh honest-ircd
+BINARIES: etherhive etherhive-vpn etherhive-crypt etherhive-mesh etherhive-ircd
 MANIFEST
 
-for bin in honest-irc honest-vpn honest-crypt honest-mesh honest-ircd; do
+for bin in etherhive etherhive-vpn etherhive-crypt etherhive-mesh etherhive-ircd; do
   BIN_HASH=$(sha256sum target/release/$bin | cut -d' ' -f1)
   BIN_SIZE=$(stat -f%z target/release/$bin 2>/dev/null || stat -c%s target/release/$bin 2>/dev/null)
   echo "BIN($bin)=$BIN_HASH size=$BIN_SIZE" >> target/release/BUILD_MANIFEST

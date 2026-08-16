@@ -1,13 +1,13 @@
-# honest-irc — Mesh Architecture (Mullvad + Tailnet)
+# etherhive — Mesh Architecture (Mullvad + Tailnet)
 
 ## Sidecar Design
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                        honest-irc node                            │
+│                        etherhive node                            │
 │                                                                   │
 │  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────┐  │
-│  │ honest-vpn   │──▶│ honest-crypt │──▶│ honest-mesh          │  │
+│  │ etherhive-vpn   │──▶│ etherhive-crypt │──▶│ etherhive-mesh          │  │
 │  │ (mullvad)    │   │ (kyber+xy)   │   │ (tailscale sidecar)  │  │
 │  │              │   │              │   │                      │  │
 │  │ double-hop   │   │ encrypt all  │   │ mesh routing         │  │
@@ -15,7 +15,7 @@
 │  └──────────────┘   └──────────────┘   └──────────┬───────────┘  │
 │                                                     │             │
 │  ┌──────────────────────────────────────────────────┼───────────┐ │
-│  │                    honest-ircd                   │           │ │
+│  │                    etherhive-ircd                   │           │ │
 │  │                                                  │           │ │
 │  │  ┌────────┐  ┌────────┐  ┌──────────┐           │           │ │
 │  │  │ irc     │  │honesty │  │ music    │           │           │ │
@@ -29,9 +29,9 @@
 
 Each sidecar is a standalone CLI binary, chained via stdin/stdout or Unix sockets:
 
-### 1. `honest-vpn` — Mullvad double-hop
+### 1. `etherhive-vpn` — Mullvad double-hop
 ```
-Usage: honest-vpn --entry <country> --exit <country>
+Usage: etherhive-vpn --entry <country> --exit <country>
 
 Connects to Mullvad VPN with a two-hop chain:
   Entry node: First Mullvad server (obfuscates origin)
@@ -42,15 +42,15 @@ All traffic from subsequent sidecars is routed through this tunnel.
 The entry/exit hop configuration is persisted and rotated every 4 hours.
 ```
 
-### 2. `honest-crypt` — Quantum-proof encryption (pre-Tailnet)
+### 2. `etherhive-crypt` — Quantum-proof encryption (pre-Tailnet)
 ```
-Usage: honest-crypt --mode kyber-x25519 --peer <route_id>
+Usage: etherhive-crypt --mode kyber-x25519 --peer <route_id>
 
 Applies CRYSTALS-Kyber-1024 + X25519 hybrid encryption to ALL traffic
 before it reaches the Tailnet mesh. This ensures:
 
 - End-to-end quantum resistance even if Tailscale's own crypto is compromised
-- Double encryption: honest-crypt layer + Tailscale's WireGuard
+- Double encryption: etherhive-crypt layer + Tailscale's WireGuard
 - The Tailnet sees only encrypted ciphertext, never plaintext
 
 Key exchange: Kyber-1024 KEM (post-quantum) + X25519 ECDH (classical)
@@ -59,9 +59,9 @@ Signatures: CRYSTALS-Dilithium-5 (post-quantum) + Ed25519 (classical)
 Forward secrecy: New Kyber ephemeral key per session, rotated every hour
 ```
 
-### 3. `honest-mesh` — Tailscale sidecar
+### 3. `etherhive-mesh` — Tailscale sidecar
 ```
-Usage: honest-mesh --tailnet <name> --authkey <key>
+Usage: etherhive-mesh --tailnet <name> --authkey <key>
 
 Manages Tailscale/Headscale mesh networking:
 - Joins the specified tailnet
@@ -71,9 +71,9 @@ Manages Tailscale/Headscale mesh networking:
 - Falls back to DERP relay when direct connections fail
 ```
 
-### 4. `honest-ircd` — The IRC daemon
+### 4. `etherhive-ircd` — The IRC daemon
 ```
-Usage: honest-ircd --identity <path/to/honesty-vector.json>
+Usage: etherhive-ircd --identity <path/to/honesty-vector.json>
 
 The main daemon:
 - Loads honesty vector for identity
@@ -85,52 +85,52 @@ The main daemon:
 ## Traffic Flow
 
 ```
-App (honest-ircd)
+App (etherhive-ircd)
   │  plaintext IRC messages
   ▼
-honest-crypt
+etherhive-crypt
   │  Kyber+X25519 encrypted
   ▼
-honest-mesh (Tailscale sidecar)
+etherhive-mesh (Tailscale sidecar)
   │  WireGuard encrypted (Tailscale's own crypto)
   ▼
-honest-vpn (Mullvad double-hop)
+etherhive-vpn (Mullvad double-hop)
   │  Entry: Mullvad server in country A
   │  Exit:  Mullvad server in country B
   ▼
-Internet ──▶ Peer's honest-vpn ──▶ Peer's honest-crypt ──▶ Peer's honest-ircd
+Internet ──▶ Peer's etherhive-vpn ──▶ Peer's etherhive-crypt ──▶ Peer's etherhive-ircd
 ```
 
 ## Why Double Hop?
 
 1. **Entry hop**: hides your real IP from the exit node and the Tailnet
 2. **Exit hop**: appears as your source IP to all peers
-3. **Neither Mullvad nor Tailscale sees plaintext**: honest-crypt encrypts before Tailscale, and Mullvad sees only WireGuard-encrypted traffic
+3. **Neither Mullvad nor Tailscale sees plaintext**: etherhive-crypt encrypts before Tailscale, and Mullvad sees only WireGuard-encrypted traffic
 4. **Compromise resistance**: if Mullvad is compromised, the adversary sees Tailscale WireGuard traffic, not plaintext. If Tailscale is compromised, the adversary sees Kyber-encrypted ciphertext, not plaintext. Both must be broken simultaneously.
 
 ## Honesty Vector → CLI Flow
 
 ```bash
 # First time: create your identity
-honest-irc init
+etherhive init
 # → interactive prompt asking the 17 honesty questions
-# → generates ~/.honest-irc/identity.json (signed with Dilithium)
-# → generates ~/.honest-irc/identity.pub (public key for peers)
+# → generates ~/.etherhive/identity.json (signed with Dilithium)
+# → generates ~/.etherhive/identity.pub (public key for peers)
 # → reserves your display name in the mesh
 
 # Start the full stack (all four sidecars):
-honest-irc up
-# → spawns honest-vpn (mullvad double-hop)
-# → spawns honest-crypt (kyber encryption)
-# → spawns honest-mesh (tailscale)
-# → spawns honest-ircd (IRC daemon)
+etherhive up
+# → spawns etherhive-vpn (mullvad double-hop)
+# → spawns etherhive-crypt (kyber encryption)
+# → spawns etherhive-mesh (tailscale)
+# → spawns etherhive-ircd (IRC daemon)
 # → joins #general on the mesh
 
 # Connect to a peer:
 /msg ⊰•-•⦑ The Architect of Structural Honesty ⦒•-•⊱ hello world
-# → honest-crypt encrypts
-# → honest-mesh routes
-# → honest-vpn double-hops
+# → etherhive-crypt encrypts
+# → etherhive-mesh routes
+# → etherhive-vpn double-hops
 # → peer decrypts, verifies Dilithium signature, displays message
 ```
 

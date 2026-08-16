@@ -1,6 +1,6 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let tailnet = args.get(1).map(|s| s.as_str()).unwrap_or("honest-irc");
+    let tailnet = args.get(1).map(|s| s.as_str()).unwrap_or("etherhive");
 
     println!("honest-mesh :: Tailscale/Headscale peer-to-peer");
     println!("  tailnet    : {}", tailnet);

@@ -13,11 +13,11 @@ impl SealedMemory {
     /// Create a new sealed memory region of `size` bytes.
     /// The region is: created via memfd (no disk backing), sealed against writes,
     /// locked in RAM via mlock, and set read-only via mprotect.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn create(name: &str, size: usize) -> Result<Self, String> {
-        let _name_c = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
-
         #[cfg(target_os = "linux")]
         {
+            let name_c = std::ffi::CString::new(name).map_err(|e| e.to_string())?;
             let fd = unsafe {
                 libc::memfd_create(
                     name_c.as_ptr(),
@@ -135,10 +135,10 @@ pub struct MemoryFortress {
 impl MemoryFortress {
     pub fn new() -> Result<Self, String> {
         Ok(MemoryFortress {
-            chat: SealedMemory::create("honest-irc-chat", 1024 * 1024 * 10)?,   // 10MB
-            crypto: SealedMemory::create("honest-irc-crypto", 1024 * 64)?,      // 64KB
-            identity: SealedMemory::create("honest-irc-identity", 1024 * 8)?,   // 8KB
-            seed: SealedMemory::create("honest-irc-seed", 1024 * 1024)?,        // 1MB
+            chat: SealedMemory::create("etherhive-chat", 1024 * 1024 * 10)?,   // 10MB
+            crypto: SealedMemory::create("etherhive-crypto", 1024 * 64)?,      // 64KB
+            identity: SealedMemory::create("etherhive-identity", 1024 * 8)?,   // 8KB
+            seed: SealedMemory::create("etherhive-seed", 1024 * 1024)?,        // 1MB
         })
     }
 

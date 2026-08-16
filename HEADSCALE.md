@@ -1,12 +1,12 @@
-# honest-irc — Headscale Setup Guide (Roadmap v1.42)
+# etherhive — Headscale Setup Guide (Roadmap v1.42)
 
 ## Overview
 
-honest-irc uses Tailscale-compatible mesh networking via the `honest-mesh` sidecar.
+etherhive uses Tailscale-compatible mesh networking via the `etherhive-mesh` sidecar.
 For fully air-gapped, self-hosted deployments, replace Tailscale's coordination
 server with **Headscale** — the open-source implementation.
 
-This guide covers deploying Headscale + honest-irc on a Hetzner CX or similar VPS,
+This guide covers deploying Headscale + etherhive on a Hetzner CX or similar VPS,
 with hardware from the [nix-base](https://github.com/peterlodri-sec/nix-base) fleet.
 
 ---
@@ -97,15 +97,15 @@ docker run -d \
 
 ---
 
-## Step 2: Create the honest-irc mesh namespace
+## Step 2: Create the etherhive mesh namespace
 
 ```bash
 # Create a user for the mesh
-headscale users create honest-irc
+headscale users create etherhive
 
 # Generate a pre-auth key (valid for 24h, reusable)
 headscale preauthkeys create \
-  --user honest-irc \
+  --user etherhive \
   --reusable \
   --expiration 24h
 
@@ -115,7 +115,7 @@ headscale preauthkeys create \
 
 ---
 
-## Step 3: Configure honest-irc peers
+## Step 3: Configure etherhive peers
 
 On each peer machine:
 
@@ -127,25 +127,25 @@ curl -fsSL https://tailscale.com/install.sh | sh
 tailscale up \
   --login-server https://mesh.yourdomain.dev \
   --authkey <PREAUTH_KEY> \
-  --hostname honest-alice \
+  --hostname etherhive-alice \
   --accept-routes
 
 # Verify connectivity
 tailscale status
-# honest-alice    alice@    linux   -
-# honest-bob      bob@      linux   active; direct 100.64.0.3:41641
+# etherhive-alice    alice@    linux   -
+# etherhive-bob      bob@      linux   active; direct 100.64.0.3:41641
 ```
 
 ---
 
-## Step 4: Start honest-irc with Headscale
+## Step 4: Start etherhive with Headscale
 
 ```bash
 # Skip the Mullvad VPN if on trusted LAN/VPS
-honest-irc up --no-vpn --headscale-url https://mesh.yourdomain.dev
+etherhive up --no-vpn --headscale-url https://mesh.yourdomain.dev
 
 # Or with full Mullvad double-hop:
-honest-irc up --headscale-url https://mesh.yourdomain.dev
+etherhive up --headscale-url https://mesh.yourdomain.dev
 ```
 
 ---
@@ -153,7 +153,7 @@ honest-irc up --headscale-url https://mesh.yourdomain.dev
 ## Step 5: Verify mesh connectivity
 
 ```bash
-honest-irc status
+etherhive status
 # Mesh: 3 peers online
 #   [The Architect of Structural Honesty] — 100.64.0.2:41641
 #   alice — 100.64.0.3:41641
@@ -196,7 +196,7 @@ curl https://mesh.yourdomain.dev/health
 
 ```bash
 headscale preauthkeys create \
-  --user honest-irc \
+  --user etherhive \
   --reusable \
   --expiration 87600h  # 10 years
 ```
@@ -217,11 +217,11 @@ headscale preauthkeys create \
 - [x] All 7 Rust tests passing
 
 ### v0.2.0 — Sidecar Sidecars [DONE]
-- [x] `honest-vpn` binary: Mullvad double-hop WireGuard via CLI
-- [x] `honest-crypt` binary: Kyber-1024 + X25519 hybrid KEM
-- [x] `honest-mesh` binary: Headscale/Tailscale auto-join
-- [x] `honest-ircd` binary: standalone daemon with TCP listener (:9667)
-- [x] Sidecar orchestration: `honest-irc up` spawns all 4
+- [x] `etherhive-vpn` binary: Mullvad double-hop WireGuard via CLI
+- [x] `etherhive-crypt` binary: Kyber-1024 + X25519 hybrid KEM
+- [x] `etherhive-mesh` binary: Headscale/Tailscale auto-join
+- [x] `etherhive-ircd` binary: standalone daemon with TCP listener (:9667)
+- [x] Sidecar orchestration: `etherhive up` spawns all 4
 - [x] ASCII architecture blueprint (ARCHITECTURE.txt)
 - [x] Pimped README with embedded architecture + security table
 
@@ -274,12 +274,12 @@ headscale preauthkeys create \
 - [x] All 7 security audit findings resolved
 
 ### v1.42 — The Answer
-- [ ] .onion / I2P overlay (Tor hidden service for honest-irc)
+- [ ] .onion / I2P overlay (Tor hidden service for etherhive)
 - [ ] Post-quantum mesh DHT (Kyber-based Kademlia)
 - [ ] Cross-platform clients: Terminal (TUI), Desktop (webview), Mobile (Flutter)
 - [ ] Quant1bitLLM live retraining from chat context
 - [ ] Honesty vector "proof of personhood" — zero-knowledge proof that you are you, without revealing the vector
-- [ ] Full nix-base fleet integration: deploy honest-irc on dev-cx53, hetzner, public-services-host
+- [ ] Full nix-base fleet integration: deploy etherhive on dev-cx53, hetzner, public-services-host
 - [ ] music.vaked.dev "listening together" — synchronized playback across peers
 
 ### v2.1 — Recursive Quant-Proof + Stabilization [DONE]

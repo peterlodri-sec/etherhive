@@ -1,4 +1,4 @@
-# honest-irc — Security Architecture
+# etherhive — Security Architecture
 
 ## Zero-Disk. Zero-Trace. Self-Encrypted Memory.
 
@@ -15,32 +15,32 @@ Before any sidecar starts, the connection is bootstrapped through
 a chain of throwaway SSH hops using /dev/fd pipes — keys never touch disk:
 
 ```
-honest-irc init
+etherhive init
   │
   ▼
 # Generate Ed25519 keys directly into RAM pipes (NOT /tmp)
-mkfifo /dev/shm/honest-hop-1.sk
-ssh-keygen -t ed25519 -f /dev/fd/3 -N "" 3>/dev/shm/honest-hop-1.sk &
-mkfifo /dev/shm/honest-hop-2.sk
-ssh-keygen -t ed25519 -f /dev/fd/4 -N "" 4>/dev/shm/honest-hop-2.sk &
-mkfifo /dev/shm/honest-hop-3.sk
-ssh-keygen -t ed25519 -f /dev/fd/5 -N "" 5>/dev/shm/honest-hop-3.sk &
+mkfifo /dev/shm/etherhive-hop-1.sk
+ssh-keygen -t ed25519 -f /dev/fd/3 -N "" 3>/dev/shm/etherhive-hop-1.sk &
+mkfifo /dev/shm/etherhive-hop-2.sk
+ssh-keygen -t ed25519 -f /dev/fd/4 -N "" 4>/dev/shm/etherhive-hop-2.sk &
+mkfifo /dev/shm/etherhive-hop-3.sk
+ssh-keygen -t ed25519 -f /dev/fd/5 -N "" 5>/dev/shm/etherhive-hop-3.sk &
   │
   ▼
 ssh -i /dev/fd/3 user@hop1.example.com \
   ssh -i /dev/fd/4 user@hop2.example.com \
     ssh -i /dev/fd/5 user@hop3.example.com \
-      "exec honest-irc up --no-init"
+      "exec etherhive up --no-init"
   │
   ▼
 # Named pipes in /dev/shm are tmpfs — gone on reboot/unlink
-rm -f /dev/shm/honest-hop-*.sk
+rm -f /dev/shm/etherhive-hop-*.sk
 ```
 
 Properties:
 - SSH keys exist only as named pipes in tmpfs (RAM-backed, never on SSD)
 - No shred needed — tmpfs is volatile memory
-- The final hop spawns the honest-irc sidecars directly
+- The final hop spawns the etherhive sidecars directly
 - No SSH key material persists on any storage device
 - If any hop is compromised, the attacker sees only another SSH connection
 
@@ -65,7 +65,7 @@ unsafe {
 
 // 1. Create anonymous in-memory file (never touches disk)
 let fd = unsafe { libc::memfd_create(
-    b"honest-irc-chat\0".as_ptr() as *const _,
+    b"etherhive-chat\0".as_ptr() as *const _,
     libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING
 ) };
 
@@ -117,22 +117,22 @@ unsafe { libc::mprotect(ptr as *mut libc::c_void, size, libc::PROT_READ); }
 
 ```bash
 # mlock of >64KB requires CAP_IPC_LOCK
-sudo setcap cap_ipc_lock=+ep /usr/bin/honest-irc
+sudo setcap cap_ipc_lock=+ep /usr/bin/etherhive
 ```
 
 ---
 
-## Layer 0: honest-vpn (Mullvad Double Hop)
+## Layer 0: etherhive-vpn (Mullvad Double Hop)
 
 ```
-honest-vpn --entry switzerland --exit iceland
+etherhive-vpn --entry switzerland --exit iceland
 ```
 
 Two-hop WireGuard tunnel. Rotated every 4 hours.
 
 ---
 
-## Layer 1: honest-crypt (Kyber + X25519 + Per-Byte LLM Sub-Keys)
+## Layer 1: etherhive-crypt (Kyber + X25519 + Per-Byte LLM Sub-Keys)
 
 ### Hybrid Key Exchange
 
@@ -143,7 +143,7 @@ Kyber-1024 (ML-KEM) + X25519 ECDH. Shared secret = Kyber || X25519.
 ```
 Every N=1000 messages: rotate session key.
   1. Fresh Kyber+X25519 exchange
-  2. New session_key = HKDF(new_shared, "honest-irc-rotate")
+  2. New session_key = HKDF(new_shared, "etherhive-rotate")
   3. Nonce counter resets
   4. Old sub-keys undecryptable: need old nonce + old session_key + old LLM weights
 ```
@@ -194,13 +194,13 @@ This prevents many-times pad key reuse attacks.
 
 ---
 
-## Layer 2: honest-mesh (Tailscale/Headscale)
+## Layer 2: etherhive-mesh (Tailscale/Headscale)
 
-Standard Tailscale mesh. All traffic already encrypted by honest-crypt.
+Standard Tailscale mesh. All traffic already encrypted by etherhive-crypt.
 
 ---
 
-## Layer 3: honest-ircd (IRC Daemon)
+## Layer 3: etherhive-ircd (IRC Daemon)
 
 The chat protocol operates over the encrypted channels. Messages are
 encrypted per-byte, stored in sealed memory.
@@ -252,10 +252,10 @@ a cryptographic defense — it is a social/behavioral trust mechanism.
 
 ## Invariant: Zero External Integration
 
-honest-irc is a fully air-gapped messaging system. The following are PROHIBITED:
+etherhive is a fully air-gapped messaging system. The following are PROHIBITED:
 
 - URL/link sharing of any kind — all URLs are stripped from messages
-- Egress connections — honest-ircd never connects outward except to peers
+- Egress connections — etherhive-ircd never connects outward except to peers
 - External API calls — music.vaked.dev data is local choreography only, never fetched
 - Image/media embedding — text-only protocol
 - All integrations are LOCAL: choreographies live in sealed memory, never fetched

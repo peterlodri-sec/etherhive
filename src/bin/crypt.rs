@@ -1,4 +1,4 @@
-use honest_irc::crypto::CryptoSession;
+use etherhive::crypto::CryptoSession;
 
 fn main() {
     println!("honest-crypt :: Kyber-1024 + X25519 hybrid encryption");

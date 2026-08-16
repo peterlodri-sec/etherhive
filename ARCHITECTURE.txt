@@ -1,9 +1,9 @@
-# honest-irc -- quantum-proof decentralized messaging
+# etherhive -- quantum-proof decentralized messaging
 auth via honesty || transport via Mullvad+Kyber+X25519+Tailscale || self-encrypted memory
 
 ```
                     +===============================================+
-                    |          HONEST-IRC QUANTUM-PROOF MESH        |
+                    |          ETHERHIVE QUANTUM-PROOF MESH         |
                     |    auth via honesty :: zero disk trace        |
                     +===============================================+
                                       |
