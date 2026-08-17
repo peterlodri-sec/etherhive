@@ -7,6 +7,17 @@ use hkdf::Hkdf;
 /// weight activations. Each activation is used as a seed for deriving a
 /// unique sub-key for each byte of plaintext. Identical plaintext bytes
 /// produce different ciphertext because each gets a unique sub-key.
+///
+/// **NOT SECURE. Design-stage code, not a real cipher.** `encrypt` XORs
+/// each byte with one byte of an HKDF output, with no random nonce
+/// anywhere in the derivation -- the same `(session_key, weights, index)`
+/// always produces the exact same keystream byte, forever. That's a
+/// many-time pad: two ciphertexts under the same session_key+weights leak
+/// their XOR difference, and known-plaintext at any position recovers the
+/// keystream at that position for every future message. SECURITY.md
+/// describes a CSPRNG-nonce'd version of this scheme; this is not that
+/// version. Not called from any live path (issue #1 finding #14) --
+/// verify that's still true before wiring this up anywhere.
 pub struct QuantByteCipher {
     /// Pre-shared LLM weights ({-1, 0, +1}^N)
     weights: Vec<i8>,

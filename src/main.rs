@@ -26,6 +26,11 @@ fn main() {
         "up" => {
             println!("etherhive :: starting all sidecars");
             println!("===================================");
+            println!("  note: etherhive-vpn, etherhive-crypt, and etherhive-mesh are");
+            println!("  prototype stubs -- they print their intended design and exit,");
+            println!("  they do not open a real tunnel, mesh, or traffic wrapper yet.");
+            println!("  see issue #1 (github.com/peterlodri-sec/etherhive/issues/1).");
+            println!("  Real, working today: etherhive-ircd (server) + etherhive-client (TUI).\n");
 
             // Sidecar chain: vpn -> crypt -> mesh -> ircd
             let sidecars: Vec<(&str, &str)> = vec![
@@ -40,7 +45,7 @@ fn main() {
                 println!("  starting {}...", name);
                 match Command::new(binary).spawn() {
                     Ok(child) => {
-                        println!("  [OK] {} (pid {})", name, child.id());
+                        println!("  [OK] {} spawned (pid {})", name, child.id());
                         children.push(child);
                     }
                     Err(e) => {
@@ -50,9 +55,8 @@ fn main() {
                 thread::sleep(Duration::from_millis(500));
             }
 
-            println!("\netherhive mesh is running. press Ctrl+C to stop.");
-            println!("  connect: etherhive connect");
-            println!("  status:  etherhive status");
+            println!("\netherhive-ircd is running. press Ctrl+C to stop.");
+            println!("  connect with the real client: etherhive-client ws://127.0.0.1:9668");
 
             // Wait for Ctrl+C
             loop {

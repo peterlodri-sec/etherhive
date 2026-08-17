@@ -74,6 +74,15 @@ pub fn strip_egress(body: &str) -> String {
 
 /// Recursive quant-proof encryption: each layer encrypts the output of the
 /// previous layer with a different sub-key. n=3 by default (triple wrap).
+///
+/// **NOT SECURE. Design-stage code, not real encryption.** Every layer is
+/// a repeating-key XOR (`ciphertext[i] = plaintext[i] ^ key[layer][i % 32]`)
+/// with no nonce and no MAC. XOR composes linearly, so wrapping it three
+/// times does not add real security over wrapping it once -- an attacker
+/// who recovers the combined keystream (trivial with any known-plaintext,
+/// e.g. a predictable header) decrypts everything encrypted under it. Not
+/// called from any live path (issue #1 finding #13) -- verify that's
+/// still true before wiring this up anywhere.
 pub struct RecursiveEncryptor {
     keys: Vec<[u8; 32]>,
     depth: usize,
