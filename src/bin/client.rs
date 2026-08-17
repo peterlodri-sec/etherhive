@@ -18,6 +18,8 @@ use etherhive::crypto::CryptoSession;
 use etherhive::hardening::{sanitize_body, strip_egress};
 use etherhive::irc::{decode_encrypted, encode_encrypted, Message};
 use etherhive::ratchet::{RatchetIdentity, RatchetSession};
+use etherhive_auth::alloy::primitives::Signature as WalletSignature;
+use etherhive_auth::alloy::signers::SignerSync;
 use etherhive_auth::uuid::Uuid;
 use etherhive_auth::{sign_challenge, AuthChallenge, Identity as WalletIdentity};
 
@@ -130,8 +132,15 @@ async fn main() {
     };
     println!("connected as: {peer_id}");
 
-    // Publish our E2E prekey bundle eagerly — reachable as soon as we're online.
-    let bundle = state.ratchet_identity.prekey_bundle();
+    // Publish our E2E prekey bundle eagerly — reachable as soon as we're
+    // online. Sign it with our wallet key so a receiver has something to
+    // verify beyond blind trust-on-first-use (see PreKeyBundle's doc
+    // comment for what the signature does and doesn't prove).
+    let mut bundle = state.ratchet_identity.prekey_bundle();
+    match state.wallet_identity.signer().sign_message_sync(&bundle.signing_bytes()) {
+        Ok(sig) => bundle.signature = Some(sig.as_bytes().to_vec()),
+        Err(e) => println!("*** warning: could not sign prekey bundle ({e}) -- publishing unsigned"),
+    }
     send(&mut write, &mut session, &mut state.seq, &Message::PrekeyBundlePublish { from: String::new(), bundle })
         .await;
     match read_encrypted(&mut read, &mut session).await {
@@ -301,6 +310,7 @@ async fn handle_command(
                  <text>              send to the current room ({} right now)\n\
                  /msg <peer> <text>  transport-encrypted DM (server can see it)\n\
                  /dm <target> <text> real E2E DM (ratchet) — target: peer_id or ENS name\n\
+                 /safety <target>    show the safety number for an established E2E session\n\
                  /login <ens.eth>    prove wallet ownership of an ENS name (shared login)\n\
                  /whoami             show my peer_id and wallet address\n\
                  /help               this help\n\
@@ -377,6 +387,20 @@ async fn handle_command(
             send_e2e(write, read, session, state, target, body).await;
         }
 
+        "/safety" => {
+            let Some(target) = parts.get(1) else {
+                println!("usage: /safety <target>");
+                return true;
+            };
+            match state.ratchet_sessions.get(*target) {
+                Some(existing) => {
+                    let ours = state.ratchet_identity.identity_key();
+                    println!("safety number for {target}: {}", existing.safety_number(ours));
+                }
+                None => println!("*** no established E2E session with {target} yet -- /dm them first"),
+            }
+        }
+
         _ if line.starts_with('/') => {
             println!("*** unknown command: {} (try /help)", parts[0]);
         }
@@ -439,6 +463,23 @@ async fn send_e2e(
             return;
         }
     };
+
+    match &bundle.signature {
+        Some(sig_bytes) => match WalletSignature::try_from(sig_bytes.as_slice()) {
+            Ok(sig) => match sig.recover_address_from_msg(bundle.signing_bytes()) {
+                Ok(addr) => println!("*** {target}'s prekey bundle is signed by wallet {addr:#x}"),
+                Err(e) => {
+                    println!("*** {target}'s prekey bundle has an INVALID signature ({e}) -- refusing to use it");
+                    return;
+                }
+            },
+            Err(e) => {
+                println!("*** {target}'s prekey bundle has a malformed signature ({e}) -- refusing to use it");
+                return;
+            }
+        },
+        None => println!("*** {target}'s prekey bundle is unsigned -- trusting via TOFU only; run /safety {target} after this to verify out-of-band"),
+    }
 
     match state.ratchet_identity.initiate(&bundle, body.as_bytes()) {
         Ok((new_session, wire)) => {
