@@ -38,7 +38,17 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let ws_url = args.get(1).cloned().unwrap_or_else(|| "ws://127.0.0.1:9668".to_string());
     // Read from an env var, not argv: a CLI argument is visible to any local
-    // user via `ps`, and lingers in shell history.
+    // user via `ps`, and lingers in shell history. Reject the old argv[2]
+    // form explicitly rather than silently ignoring it -- an invocation
+    // that used to supply a mnemonic there must not silently fall through
+    // to a freshly generated wallet (a different, unintended identity).
+    if args.get(2).is_some() {
+        eprintln!(
+            "error: passing the mnemonic as a command-line argument is no longer supported \
+             (it's visible via `ps` and shell history). Set ETHERHIVE_MNEMONIC instead."
+        );
+        std::process::exit(1);
+    }
     let mnemonic = std::env::var("ETHERHIVE_MNEMONIC").ok();
 
     println!("etherhive-client :: connecting to {ws_url}...");
