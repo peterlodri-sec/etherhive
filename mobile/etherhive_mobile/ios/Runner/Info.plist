@@ -4,6 +4,16 @@
 <dict>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
+	<!-- The connect screen takes an arbitrary user-entered ws:// host:port,
+	     not a fixed domain, so there's no NSExceptionDomains list that would
+	     make sense here, and neither side of the protocol speaks wss://
+	     yet. Matches the equivalent, equally blanket
+	     android:usesCleartextTraffic="true" already accepted for Android. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

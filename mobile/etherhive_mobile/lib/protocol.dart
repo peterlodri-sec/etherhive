@@ -56,7 +56,10 @@ sealed class Message {
             body: value['body'] as String,
           );
         case 'Join':
-          return JoinMessage(from: value['from'] as String, room: value['room'] as String);
+          return JoinMessage(
+            from: value['from'] as String,
+            room: value['room'] as String,
+          );
         default:
           return Unknown(json);
       }
@@ -78,11 +81,19 @@ class TextMessage extends Message {
   final String from;
   final String room;
   final String body;
-  const TextMessage({required this.from, required this.room, required this.body});
+  const TextMessage({
+    required this.from,
+    required this.room,
+    required this.body,
+  });
   @override
   String _unitName() => 'Text';
   @override
-  Map<String, dynamic>? _variantJson() => {'from': from, 'room': room, 'body': body};
+  Map<String, dynamic>? _variantJson() => {
+    'from': from,
+    'room': room,
+    'body': body,
+  };
 }
 
 /// Transport-encrypted DM. NOT end-to-end -- the server decrypts to route
@@ -97,7 +108,11 @@ class DmMessage extends Message {
   @override
   String _unitName() => 'Dm';
   @override
-  Map<String, dynamic>? _variantJson() => {'from': from, 'to': to, 'body': body};
+  Map<String, dynamic>? _variantJson() => {
+    'from': from,
+    'to': to,
+    'body': body,
+  };
 }
 
 class JoinMessage extends Message {
@@ -135,20 +150,22 @@ class Unknown extends Message {
   @override
   String _unitName() => throw UnsupportedError('Unknown is receive-only');
   @override
-  Map<String, dynamic>? _variantJson() => throw UnsupportedError('Unknown is receive-only');
+  Map<String, dynamic>? _variantJson() =>
+      throw UnsupportedError('Unknown is receive-only');
 }
 
 /// Encrypts a [Message] into a wire-format Envelope JSON string, matching
 /// `etherhive::irc::encode_encrypted`. `Envelope.payload` is a raw byte
 /// array (serde's default `Vec<u8>` -> JSON array-of-numbers, not base64).
-Future<String> encodeEncrypted(Message msg, CryptoSession session, String from, int seq) async {
+Future<String> encodeEncrypted(
+  Message msg,
+  CryptoSession session,
+  String from,
+  int seq,
+) async {
   final plaintext = utf8.encode(jsonEncode(msg.toWire()));
   final payload = await session.encryptMessage(plaintext);
-  return jsonEncode({
-    'from': from,
-    'payload': payload.toList(),
-    'seq': seq,
-  });
+  return jsonEncode({'from': from, 'payload': payload.toList(), 'seq': seq});
 }
 
 /// Decrypts a wire-format Envelope JSON string back into a [Message].
@@ -160,7 +177,9 @@ Future<Message?> decodeEncrypted(String data, CryptoSession session) async {
   } catch (_) {
     return null;
   }
-  final payload = (envelope['payload'] as List<dynamic>).cast<int>();
+  final payloadRaw = envelope['payload'];
+  if (payloadRaw is! List) return null;
+  final payload = payloadRaw.cast<int>();
   final plaintext = await session.decryptMessage(payload);
   if (plaintext == null) return null;
   try {

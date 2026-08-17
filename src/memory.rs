@@ -68,7 +68,10 @@ impl SealedMemory {
             Ok(SealedMemory {
                 ptr: ptr as *mut u8,
                 size,
-                fd: Some(unsafe { File::from_raw_fd(fd) }),
+                fd: Some(unsafe {
+                    use std::os::unix::io::FromRawFd;
+                    std::fs::File::from_raw_fd(fd)
+                }),
             })
         }
 

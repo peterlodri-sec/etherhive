@@ -1,0 +1,136 @@
+name: Mobile CI
+
+# Standard GitHub-hosted runners, deliberately -- ci.yml (the Rust build)
+# runs on blacksmith-4vcpu-ubuntu-2204, which this account doesn't appear to
+# have working access to (recent runs sit "pending" indefinitely). Using
+# GitHub-hosted runners here means this workflow actually runs.
+
+on:
+  push:
+    branches: [main]
+    paths: ["mobile/**", ".github/workflows/mobile-ci.yml"]
+  pull_request:
+    paths: ["mobile/**", ".github/workflows/mobile-ci.yml"]
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      - run: flutter analyze
+        working-directory: mobile/etherhive_mobile
+      - run: flutter test test/widget_test.dart test/etherhive_error_test.dart
+        working-directory: mobile/etherhive_mobile
+
+  # The real test: a live etherhive-ircd (built from this same commit) and
+  # the actual production client code exchanging real messages over the
+  # real protocol -- not a mock, same discipline as the rest of this repo.
+  live-server-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build etherhive-ircd
+        run: cargo build --release --bin etherhive-ircd
+      - name: start etherhive-ircd
+        run: |
+          ./target/release/etherhive-ircd 19770 19771 &
+          for i in $(seq 1 20); do
+            (echo > /dev/tcp/127.0.0.1/19771) >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      - name: client-against-live-server test
+        run: flutter test test/etherhive_client_test.dart --dart-define=ETHERHIVE_TEST_WS_URL=ws://127.0.0.1:19771
+        working-directory: mobile/etherhive_mobile
+
+  build-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      - run: flutter build web
+        working-directory: mobile/etherhive_mobile
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      # Debug build -- a release APK needs a signing key this repo doesn't
+      # have and shouldn't invent one for CI. This still proves the Android
+      # project (Gradle config, manifest, permissions) actually builds.
+      - run: flutter build apk --debug
+        working-directory: mobile/etherhive_mobile
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      # --no-codesign: no Apple signing identity in CI. Proves the iOS
+      # project compiles; doesn't produce an installable IPA.
+      - run: flutter build ios --no-codesign
+        working-directory: mobile/etherhive_mobile
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      - run: flutter build macos
+        working-directory: mobile/etherhive_mobile
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      - run: flutter build windows
+        working-directory: mobile/etherhive_mobile
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev libstdc++-12-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - run: flutter pub get
+        working-directory: mobile/etherhive_mobile
+      - run: flutter build linux
+        working-directory: mobile/etherhive_mobile

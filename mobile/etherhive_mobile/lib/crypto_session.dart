@@ -36,8 +36,14 @@ class CryptoSession {
   /// always sends its pubkey first in the handshake, so the role is
   /// unambiguous on both ends without negotiating it on the wire. The mobile
   /// client is always the client: pass `weAreServer: false`.
-  Future<void> exchange(List<int> peerPublicKeyBytes, {required bool weAreServer}) async {
-    final remotePublicKey = SimplePublicKey(peerPublicKeyBytes, type: KeyPairType.x25519);
+  Future<void> exchange(
+    List<int> peerPublicKeyBytes, {
+    required bool weAreServer,
+  }) async {
+    final remotePublicKey = SimplePublicKey(
+      peerPublicKeyBytes,
+      type: KeyPairType.x25519,
+    );
     final sharedSecret = await _algorithm.sharedSecretKey(
       keyPair: _keyPair,
       remotePublicKey: remotePublicKey,
@@ -49,8 +55,14 @@ class CryptoSession {
 
     final hkdf = Hkdf(hmac: Hmac.sha256(), outputLength: 32);
     final ikm = SecretKey(raw);
-    final serverToClient = await hkdf.deriveKey(secretKey: ikm, info: utf8.encode(_serverToClientInfo));
-    final clientToServer = await hkdf.deriveKey(secretKey: ikm, info: utf8.encode(_clientToServerInfo));
+    final serverToClient = await hkdf.deriveKey(
+      secretKey: ikm,
+      info: utf8.encode(_serverToClientInfo),
+    );
+    final clientToServer = await hkdf.deriveKey(
+      secretKey: ikm,
+      info: utf8.encode(_clientToServerInfo),
+    );
 
     if (weAreServer) {
       _sendKey = await serverToClient.extractBytes();

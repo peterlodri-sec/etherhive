@@ -7,13 +7,20 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'crypto_session.dart';
 import 'protocol.dart';
 
-enum ConnectionStatus { disconnected, connecting, handshaking, connected, error }
+enum ConnectionStatus {
+  disconnected,
+  connecting,
+  handshaking,
+  connected,
+  error,
+}
 
 class ChatEntry {
   final String label; // e.g. "[#general] <peer>" or "*** system"
   final String body;
   final bool isSelf;
-  ChatEntry(this.label, this.body, {this.isSelf = false});
+  final bool isDm;
+  ChatEntry(this.label, this.body, {this.isSelf = false, this.isDm = false});
 }
 
 /// Connection + protocol state for the EtherHive mobile client. Mirrors
@@ -33,8 +40,10 @@ class EtherhiveClient extends ChangeNotifier {
   final List<ChatEntry> messages = [];
 
   int _seq = 0;
+  String? _lastUrl;
 
   Future<void> connect(String wsUrl) async {
+    _lastUrl = wsUrl;
     status = ConnectionStatus.connecting;
     errorMessage = null;
     messages.clear();
@@ -43,7 +52,10 @@ class EtherhiveClient extends ChangeNotifier {
     try {
       final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
       _channel = channel;
-      await channel.ready;
+      await channel.ready.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () => throw StateError('could not reach server'),
+      );
 
       status = ConnectionStatus.handshaking;
       notifyListeners();
@@ -63,15 +75,21 @@ class EtherhiveClient extends ChangeNotifier {
       // unambiguous for CryptoSession.exchange's directional keys.
       final pubkeyEvent = await queue.next.timeout(
         const Duration(seconds: 10),
-        onTimeout: () => throw StateError('server did not send a transport handshake in time'),
+        onTimeout: () => throw StateError(
+          'server did not send a transport handshake in time',
+        ),
       );
       final serverPubkeyBytes = switch (pubkeyEvent) {
         Uint8List b => b,
         List<int> b => Uint8List.fromList(b),
-        _ => throw StateError('expected a binary handshake frame, got ${pubkeyEvent.runtimeType}'),
+        _ => throw StateError(
+          'expected a binary handshake frame, got ${pubkeyEvent.runtimeType}',
+        ),
       };
       if (serverPubkeyBytes.length != 32) {
-        throw StateError('expected a 32-byte transport pubkey, got ${serverPubkeyBytes.length} bytes');
+        throw StateError(
+          'expected a 32-byte transport pubkey, got ${serverPubkeyBytes.length} bytes',
+        );
       }
 
       channel.sink.add(session.publicKeyBytes);
@@ -81,21 +99,30 @@ class EtherhiveClient extends ChangeNotifier {
       // connected, same reason as above.
       final welcomeEvent = await queue.next.timeout(
         const Duration(seconds: 10),
-        onTimeout: () => throw StateError('server did not send a welcome in time'),
+        onTimeout: () =>
+            throw StateError('server did not send a welcome in time'),
       );
       if (welcomeEvent is! String) {
-        throw StateError('expected the welcome as a text frame, got ${welcomeEvent.runtimeType}');
+        throw StateError(
+          'expected the welcome as a text frame, got ${welcomeEvent.runtimeType}',
+        );
       }
       final welcome = await decodeEncrypted(welcomeEvent, session);
       if (welcome is! SystemMessage) {
         throw StateError('expected a System welcome message, got $welcome');
       }
       const prefix = 'connected as ';
-      peerId = welcome.body.startsWith(prefix) ? welcome.body.substring(prefix.length) : 'unknown';
+      peerId = welcome.body.startsWith(prefix)
+          ? welcome.body.substring(prefix.length)
+          : 'unknown';
 
       // Handshake phase done -- hand the remaining stream to the persistent
       // listener for normal message flow.
-      _subscription = queue.rest.listen(_onRawEvent, onDone: _onDone, onError: _onError);
+      _subscription = queue.rest.listen(
+        _onRawEvent,
+        onDone: _onDone,
+        onError: _onError,
+      );
 
       status = ConnectionStatus.connected;
       notifyListeners();
@@ -132,7 +159,14 @@ class EtherhiveClient extends ChangeNotifier {
 
   void _onRawEvent(dynamic event) {
     if (event is String) {
-      _processingChain = _processingChain.then((_) => _handleEncryptedText(event));
+      // catchError so one malformed frame can't permanently poison the
+      // chain -- without it, an unhandled exception here leaves
+      // _processingChain in a failed state forever, and every future
+      // frame's `.then()` short-circuits on that failure instead of ever
+      // running _handleEncryptedText again.
+      _processingChain = _processingChain
+          .then((_) => _handleEncryptedText(event))
+          .catchError((_) {});
     }
     // Binary frames after the handshake aren't part of this protocol; ignore.
   }
@@ -152,7 +186,7 @@ class EtherhiveClient extends ChangeNotifier {
       case TextMessage(:final from, :final room, :final body):
         messages.add(ChatEntry('[$room] <$from>', body));
       case DmMessage(:final from, :final body):
-        messages.add(ChatEntry('[msg from $from]', body));
+        messages.add(ChatEntry('[msg from $from]', body, isDm: true));
       case JoinMessage():
         break; // server echoes our own Join as a System message; nothing else to show
       case Ping():
@@ -164,7 +198,8 @@ class EtherhiveClient extends ChangeNotifier {
   }
 
   void _onDone() {
-    if (status == ConnectionStatus.connected || status == ConnectionStatus.handshaking) {
+    if (status == ConnectionStatus.connected ||
+        status == ConnectionStatus.handshaking) {
       status = ConnectionStatus.disconnected;
       errorMessage = 'connection closed by server';
       notifyListeners();
@@ -185,16 +220,31 @@ class EtherhiveClient extends ChangeNotifier {
   Future<bool> _send(Message msg) async {
     final channel = _channel;
     final session = _session;
-    if (channel == null || session == null || status != ConnectionStatus.connected) return false;
+    if (channel == null ||
+        session == null ||
+        status != ConnectionStatus.connected) {
+      return false;
+    }
     _seq += 1;
     final frame = await encodeEncrypted(msg, session, 'etherhive-mobile', _seq);
     channel.sink.add(frame);
     return true;
   }
 
+  /// Surface a client-side usage/validation error (e.g. a malformed slash
+  /// command) as a system chat entry, for callers that don't otherwise
+  /// have write access to `messages`/`notifyListeners` (both intentionally
+  /// not public).
+  void reportUsageError(String hint) {
+    messages.add(ChatEntry('***', hint));
+    notifyListeners();
+  }
+
   Future<void> sendRoomText(String body) async {
     if (body.trim().isEmpty) return;
-    final sent = await _send(TextMessage(from: '', room: currentRoom, body: body));
+    final sent = await _send(
+      TextMessage(from: '', room: currentRoom, body: body),
+    );
     if (sent) {
       messages.add(ChatEntry('[$currentRoom] <you>', body, isSelf: true));
     } else {
@@ -207,7 +257,9 @@ class EtherhiveClient extends ChangeNotifier {
     if (target.trim().isEmpty || body.trim().isEmpty) return;
     final sent = await _send(DmMessage(from: '', to: target, body: body));
     if (sent) {
-      messages.add(ChatEntry('[msg to $target]', body, isSelf: true));
+      messages.add(
+        ChatEntry('[msg to $target]', body, isSelf: true, isDm: true),
+      );
     } else {
       messages.add(ChatEntry('***', 'not sent -- not connected'));
     }
@@ -228,15 +280,41 @@ class EtherhiveClient extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Reconnect to whatever URL `connect()` was last given, without the
+  /// caller needing to hold onto it (e.g. a "Reconnect" button on the chat
+  /// screen after a disconnect, with no need to navigate back to the
+  /// connect screen).
+  Future<void> reconnect() async {
+    final url = _lastUrl;
+    if (url == null) return;
+    await connect(url);
+  }
+
   Future<void> disconnect() async {
     await _subscription?.cancel();
-    await _channel?.sink.close();
+    // Bounded the same way as the handshake-failure cleanup in connect():
+    // some implementations never resolve close() on a socket that never
+    // finished connecting, and this must not hang the UI's logout flow.
+    try {
+      await _channel?.sink.close().timeout(const Duration(seconds: 2));
+    } catch (_) {}
     _subscription = null;
     _channel = null;
     _session = null;
     peerId = null;
     status = ConnectionStatus.disconnected;
     notifyListeners();
+  }
+
+  /// Best-effort cleanup if this client is disposed without an explicit
+  /// disconnect() (e.g. the owning widget is torn down). dispose() must be
+  /// synchronous, so this fires the cleanup without awaiting it and never
+  /// calls notifyListeners() -- that's unsafe once disposal has started.
+  @override
+  void dispose() {
+    _subscription?.cancel();
+    _channel?.sink.close();
+    super.dispose();
   }
 
   String _cleanError(Object e) {
