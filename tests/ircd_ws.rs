@@ -62,7 +62,7 @@ async fn dm_is_encrypted_on_the_wire_and_routed_to_the_right_peer() {
     };
     let mut session_a = CryptoSession::new();
     write_a.send(WsMessage::Binary(session_a.public_key_bytes().to_vec())).await.unwrap();
-    session_a.exchange(&server_pub_a);
+    session_a.exchange(&server_pub_a, false).unwrap();
     // Every encrypted frame must actually be decrypted (not just read off the
     // wire) to keep both sides' CryptoSession nonce counters in lockstep.
     let welcome_text_a = match read_a.next().await.unwrap().unwrap() {
@@ -84,7 +84,7 @@ async fn dm_is_encrypted_on_the_wire_and_routed_to_the_right_peer() {
     };
     let mut session_b = CryptoSession::new();
     write_b.send(WsMessage::Binary(session_b.public_key_bytes().to_vec())).await.unwrap();
-    session_b.exchange(&server_pub_b);
+    session_b.exchange(&server_pub_b, false).unwrap();
 
     let welcome_text_b = match read_b.next().await.unwrap().unwrap() {
         WsMessage::Text(t) => t,

@@ -37,7 +37,9 @@ struct ClientState {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let ws_url = args.get(1).cloned().unwrap_or_else(|| "ws://127.0.0.1:9668".to_string());
-    let mnemonic = args.get(2).cloned();
+    // Read from an env var, not argv: a CLI argument is visible to any local
+    // user via `ps`, and lingers in shell history.
+    let mnemonic = std::env::var("ETHERHIVE_MNEMONIC").ok();
 
     println!("etherhive-client :: connecting to {ws_url}...");
     let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("failed to connect to ircd");
@@ -54,7 +56,7 @@ async fn main() {
     };
     let mut session = CryptoSession::new();
     write.send(WsMessage::Binary(session.public_key_bytes().to_vec())).await.expect("send pubkey");
-    session.exchange(&server_pub);
+    session.exchange(&server_pub, false).expect("transport key exchange failed");
 
     let wallet_identity = match &mnemonic {
         Some(phrase) => WalletIdentity::from_mnemonic(phrase, 0).expect("invalid mnemonic"),
