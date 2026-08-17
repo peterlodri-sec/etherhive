@@ -34,15 +34,19 @@ type PrekeyBundles = Arc<Mutex<HashMap<String, PreKeyBundle>>>;
 /// (ephemeral, un-walleted-default) peer_id — ULTRAPLAN phase 3 "shared
 /// login". Un-walleted connections are unaffected; this is additive.
 type AuthenticatedNames = Arc<Mutex<HashMap<String, String>>>;
-/// uuid -> (ens_name, issued_at). Populated by `AuthChallengeRequest`,
-/// consumed (removed) by a matching `AuthLogin` -- this is what closes the
-/// gap `etherhive_auth::auth::verify_challenge`'s own doc comment flags:
-/// the crate is stateless and can verify a signature is fresh and correct,
-/// but only the caller can refuse to accept the *same* valid signature
-/// twice. Entries older than `AUTH_MAX_AGE_SECS` are swept lazily on each
-/// new request so an attacker spamming unredeemed challenges doesn't grow
-/// this map forever.
-type PendingChallenges = Arc<Mutex<HashMap<Uuid, (String, u64)>>>;
+/// peer_id -> (uuid, ens_name, issued_at). Populated by
+/// `AuthChallengeRequest`, consumed (removed) by a matching `AuthLogin` --
+/// this is what closes the gap `etherhive_auth::auth::verify_challenge`'s
+/// own doc comment flags: the crate is stateless and can verify a
+/// signature is fresh and correct, but only the caller can refuse to
+/// accept the *same* valid signature twice. Keyed by peer_id rather than
+/// uuid so a connection can only ever have one pending challenge at a
+/// time -- a new request replaces the old one instead of adding another
+/// entry, which bounds this map to "one entry per currently-connected
+/// peer" instead of growing with every request a peer ever sends. Removed
+/// outright on disconnect, same as ws_peers/authenticated_names/the rate
+/// limiter.
+type PendingChallenges = Arc<Mutex<HashMap<String, (Uuid, String, u64)>>>;
 type WsSink = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, WsMessage>;
 
 /// How long a server-issued AuthChallenge stays redeemable, and (per
@@ -51,6 +55,12 @@ type WsSink = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream
 /// `(challenge, signature)` pair is no longer replayable at all -- not just
 /// bounded to this window.
 const AUTH_MAX_AGE_SECS: u64 = 300;
+
+/// Real ENS names are well under this (253 is the classic DNS full-name
+/// length cap). Rejected outright rather than truncated, so an
+/// `AuthChallengeRequest` can't be used to stash an arbitrarily large
+/// string in `PendingChallenges`.
+const MAX_ENS_NAME_LEN: usize = 253;
 
 /// Default RPC endpoint for ENS ownership lookups — a public node, no API
 /// key needed. Override with a 3rd CLI arg for production use.
@@ -459,6 +469,7 @@ async fn handle_ws_client(
 
     ws_peers.lock().unwrap().remove(&peer_id);
     authenticated_names.lock().unwrap().retain(|_, v| v != &peer_id);
+    pending_challenges.lock().unwrap().remove(&peer_id);
 }
 
 /// Dispatch one decrypted `Message` from a WS peer. The sender's `from` field
@@ -486,13 +497,17 @@ async fn handle_ws_message(
         // The server generates the challenge, not the client, and remembers
         // it as pending-and-single-use -- see PendingChallenges' doc comment.
         Message::AuthChallengeRequest { ens_name } => {
+            if ens_name.is_empty() || ens_name.len() > MAX_ENS_NAME_LEN {
+                let notice = Message::System { body: "invalid ens_name".to_string() };
+                send_encrypted(write, session, seq, &notice).await;
+                return;
+            }
             let uuid = Uuid::new_v4();
             let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            {
-                let mut pending = pending_challenges.lock().unwrap();
-                pending.retain(|_, (_, issued_at)| timestamp.saturating_sub(*issued_at) <= AUTH_MAX_AGE_SECS);
-                pending.insert(uuid, (ens_name, timestamp));
-            }
+            // Keyed by peer_id: this replaces any previous unredeemed
+            // challenge for this connection rather than adding another
+            // entry, so repeatedly requesting can't grow the map.
+            pending_challenges.lock().unwrap().insert(peer_id.to_string(), (uuid, ens_name, timestamp));
             let resp = Message::AuthChallengeIssued { uuid: uuid.to_string(), timestamp };
             send_encrypted(write, session, seq, &resp).await;
         }
@@ -506,7 +521,15 @@ async fn handle_ws_message(
             let redeemed = match uuid.parse::<Uuid>() {
                 Ok(parsed) => {
                     let mut pending = pending_challenges.lock().unwrap();
-                    matches!(pending.remove(&parsed), Some((issued_ens, issued_ts)) if issued_ens == ens_name && issued_ts == timestamp)
+                    let matches = matches!(
+                        pending.get(peer_id),
+                        Some((pending_uuid, pending_ens, pending_ts))
+                            if *pending_uuid == parsed && *pending_ens == ens_name && *pending_ts == timestamp
+                    );
+                    if matches {
+                        pending.remove(peer_id);
+                    }
+                    matches
                 }
                 Err(_) => false,
             };
