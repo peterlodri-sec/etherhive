@@ -617,6 +617,63 @@ async fn handle_ws_message(
             }
         }
 
+        // Ephemeral -- never stored in ChatHistory. Silently dropped if
+        // nobody's listening, matching `Typing`'s own doc comment: an
+        // indicator that never arrives isn't a failure worth surfacing.
+        Message::Typing { room, .. } => {
+            let members = {
+                let d = daemon.lock().unwrap();
+                d.rooms.iter().find(|r| r.name == room).map(|r| r.members.clone()).unwrap_or_default()
+            };
+            let out = Message::Typing { from: peer_id.to_string(), room };
+            let registry = ws_peers.lock().unwrap();
+            for member in &members {
+                if member != peer_id {
+                    if let Some(tx) = registry.get(member) {
+                        let _ = tx.send(out.clone());
+                    }
+                }
+            }
+        }
+
+        Message::TypingDm { to, .. } => {
+            let to = resolve_target(&to, authenticated_names);
+            let out = Message::TypingDm { from: peer_id.to_string(), to: to.clone() };
+            if let Some(tx) = ws_peers.lock().unwrap().get(&to) {
+                let _ = tx.send(out);
+            }
+        }
+
+        // Also ephemeral -- not appended to ChatHistory. Unlike Typing, a
+        // read receipt is a meaningful ack, so ReadReceiptDm (below) does
+        // report routing failure back to the sender the same way Dm does.
+        Message::ReadReceipt { room, up_to_timestamp, .. } => {
+            let members = {
+                let d = daemon.lock().unwrap();
+                d.rooms.iter().find(|r| r.name == room).map(|r| r.members.clone()).unwrap_or_default()
+            };
+            let out = Message::ReadReceipt { from: peer_id.to_string(), room, up_to_timestamp };
+            let registry = ws_peers.lock().unwrap();
+            for member in &members {
+                if member != peer_id {
+                    if let Some(tx) = registry.get(member) {
+                        let _ = tx.send(out.clone());
+                    }
+                }
+            }
+        }
+
+        Message::ReadReceiptDm { to, up_to_timestamp, .. } => {
+            let to = resolve_target(&to, authenticated_names);
+            let out = Message::ReadReceiptDm { from: peer_id.to_string(), to: to.clone(), up_to_timestamp };
+            let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
+            let sent = target_tx.map(|tx| tx.send(out).is_ok()).unwrap_or(false);
+            if !sent {
+                let notice = Message::System { body: format!("no such peer: {}", to) };
+                send_encrypted(write, session, seq, &notice).await;
+            }
+        }
+
         Message::Join { room, .. } => {
             let Some(room) = sanitize_room(&room) else {
                 let notice = Message::System { body: "invalid room name".to_string() };

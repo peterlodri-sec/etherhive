@@ -61,6 +61,24 @@ pub enum Message {
     Quant { from: String, target: String, seed: String },
     /// System message
     System { body: String },
+    /// Typing indicator in a room. Ephemeral -- never stored in
+    /// ChatHistory, best-effort delivery. Unlike `Text`, the server does
+    /// not report an error if the room currently has no other members;
+    /// a typing indicator that never arrives just means nobody sees it,
+    /// not a failure worth surfacing.
+    Typing { from: String, room: String },
+    /// Typing indicator for a 1:1 DM (transport-encrypted only, matching
+    /// `Dm` -- not real E2E; see `Ratchet` for that).
+    TypingDm { from: String, to: String },
+    /// Read receipt: `from` has read `room`'s messages up through this
+    /// Unix timestamp (seconds). Timestamp-keyed rather than a per-message
+    /// ID scheme, matching how `ChatHistory`/`SearchIndex` already key
+    /// messages -- this project has no per-message ID concept anywhere
+    /// else, and inventing one solely for receipts would be its own
+    /// significant protocol change.
+    ReadReceipt { from: String, room: String, up_to_timestamp: u64 },
+    /// Read receipt for a 1:1 DM.
+    ReadReceiptDm { from: String, to: String, up_to_timestamp: u64 },
     /// Ping
     Ping,
     /// Pong

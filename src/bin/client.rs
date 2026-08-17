@@ -6,6 +6,7 @@
 //! speaks it.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
@@ -268,6 +269,14 @@ fn handle_incoming(msg: Message, state: &mut ClientState) {
         Message::System { body } => println!("*** {body}"),
         Message::Text { from, room, body } => println!("[{room}] <{from}> {body}"),
         Message::Dm { from, body, .. } => println!("[dm from {from}] {body}"),
+        Message::Typing { from, room } => println!("*** {from} is typing in {room}..."),
+        Message::TypingDm { from, .. } => println!("*** {from} is typing..."),
+        Message::ReadReceipt { from, room, up_to_timestamp } => {
+            println!("*** {from} has read {room} up to {up_to_timestamp}")
+        }
+        Message::ReadReceiptDm { from, up_to_timestamp, .. } => {
+            println!("*** {from} has read up to {up_to_timestamp}")
+        }
         Message::Ratchet { from, wire, .. } => {
             if let Some(existing) = state.ratchet_sessions.get_mut(&from) {
                 match existing.decrypt(&wire) {
@@ -324,6 +333,10 @@ async fn handle_command(
                  <text>              send to the current room ({} right now)\n\
                  /msg <peer> <text>  transport-encrypted DM (server can see it)\n\
                  /dm <target> <text> real E2E DM (ratchet) — target: peer_id or ENS name\n\
+                 /typing             tell the current room you're typing\n\
+                 /typing <peer>      tell a peer you're typing them a DM\n\
+                 /read               mark the current room read, up to now\n\
+                 /read <peer>        mark a peer's DMs read, up to now\n\
                  /safety <target>    show the safety number for an established E2E session\n\
                  /login <ens.eth>    prove wallet ownership of an ENS name (shared login)\n\
                  /whoami             show my peer_id and wallet address\n\
@@ -399,6 +412,23 @@ async fn handle_command(
                 return true;
             };
             send_e2e(write, read, session, state, rpc_url, target, body).await;
+        }
+
+        "/typing" => {
+            let msg = match parts.get(1) {
+                Some(target) => Message::TypingDm { from: String::new(), to: target.to_string() },
+                None => Message::Typing { from: String::new(), room: state.current_room.clone() },
+            };
+            send(write, session, &mut state.seq, &msg).await;
+        }
+
+        "/read" => {
+            let up_to_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let msg = match parts.get(1) {
+                Some(target) => Message::ReadReceiptDm { from: String::new(), to: target.to_string(), up_to_timestamp },
+                None => Message::ReadReceipt { from: String::new(), room: state.current_room.clone(), up_to_timestamp },
+            };
+            send(write, session, &mut state.seq, &msg).await;
         }
 
         "/safety" => {

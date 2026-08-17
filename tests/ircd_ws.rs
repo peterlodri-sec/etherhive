@@ -320,3 +320,185 @@ async fn auth_challenge_is_length_capped_and_one_per_connection() {
         other => panic!("expected the superseded challenge to be rejected, got {:?}", other),
     }
 }
+
+/// Phase 2 "read/typing receipts": `Typing`/`ReadReceipt` broadcast to a
+/// room's other members the same way `Text` does; `TypingDm`/`ReadReceiptDm`
+/// route peer-to-peer the same way `Dm` does. Also proves the documented
+/// asymmetry -- `TypingDm` to a nonexistent peer is silently dropped (typing
+/// is best-effort, never worth an error), while `ReadReceiptDm` to a
+/// nonexistent peer reports "no such peer", matching `Dm`'s own behavior.
+#[tokio::test]
+async fn typing_and_read_receipts_route_like_text_and_dm() {
+    let ircd_bin = env!("CARGO_BIN_EXE_etherhive-ircd");
+    let port = 19673u16;
+    let ws_port = 19674u16;
+    let _guard = IrcdGuard(
+        Command::new(ircd_bin)
+            .args([port.to_string(), ws_port.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn etherhive-ircd"),
+    );
+
+    wait_for_port(ws_port).await;
+    let url = format!("ws://127.0.0.1:{}", ws_port);
+
+    // --- client A: connect + X25519 handshake ---
+    let (ws_a, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("A connect");
+    let (mut write_a, mut read_a) = ws_a.split();
+    let server_pub_a = match read_a.next().await.unwrap().unwrap() {
+        WsMessage::Binary(b) => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            x25519_dalek::PublicKey::from(arr)
+        }
+        other => panic!("A: expected server pubkey, got {:?}", other),
+    };
+    let mut session_a = CryptoSession::new();
+    write_a.send(WsMessage::Binary(session_a.public_key_bytes().to_vec())).await.unwrap();
+    session_a.exchange(&server_pub_a, false).unwrap();
+    let welcome_text_a = match read_a.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("A: expected welcome envelope, got {:?}", other),
+    };
+    let peer_a = match decode_encrypted(&welcome_text_a, &mut session_a).expect("A decrypt welcome") {
+        Message::System { body } => body.strip_prefix("connected as ").unwrap().to_string(),
+        other => panic!("A: expected System welcome, got {:?}", other),
+    };
+
+    // --- client B: connect + X25519 handshake ---
+    let (ws_b, _) = tokio_tungstenite::connect_async(url.as_str()).await.expect("B connect");
+    let (mut write_b, mut read_b) = ws_b.split();
+    let server_pub_b = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Binary(b) => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            x25519_dalek::PublicKey::from(arr)
+        }
+        other => panic!("B: expected server pubkey, got {:?}", other),
+    };
+    let mut session_b = CryptoSession::new();
+    write_b.send(WsMessage::Binary(session_b.public_key_bytes().to_vec())).await.unwrap();
+    session_b.exchange(&server_pub_b, false).unwrap();
+    let welcome_text_b = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("B: expected welcome envelope, got {:?}", other),
+    };
+    let peer_b = match decode_encrypted(&welcome_text_b, &mut session_b).expect("B decrypt welcome") {
+        Message::System { body } => body.strip_prefix("connected as ").unwrap().to_string(),
+        other => panic!("B: expected System welcome, got {:?}", other),
+    };
+
+    // --- both join #general (each only gets their own join confirmation
+    // back -- Join never broadcasts to existing members) ---
+    let join = Message::Join { from: String::new(), room: "#general".to_string() };
+    let frame = encode_encrypted(&join, &mut session_a, "test-a", 1);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let resp = match read_a.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("A: expected join confirmation, got {:?}", other),
+    };
+    decode_encrypted(&resp, &mut session_a).expect("A decrypt join confirmation");
+
+    let frame = encode_encrypted(&join, &mut session_b, "test-b", 1);
+    write_b.send(WsMessage::Text(frame)).await.unwrap();
+    let resp = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("B: expected join confirmation, got {:?}", other),
+    };
+    decode_encrypted(&resp, &mut session_b).expect("B decrypt join confirmation");
+
+    // --- A types in #general; B (the only other member) sees it ---
+    let typing = Message::Typing { from: String::new(), room: "#general".to_string() };
+    let frame = encode_encrypted(&typing, &mut session_a, "test-a", 2);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let received = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("B: expected Typing, got {:?}", other),
+    };
+    match decode_encrypted(&received, &mut session_b).expect("B decrypt Typing") {
+        Message::Typing { from, room } => {
+            assert_eq!(from, peer_a);
+            assert_eq!(room, "#general");
+        }
+        other => panic!("B: expected Typing, got {:?}", other),
+    }
+
+    // --- A marks #general read up to some timestamp; B sees the receipt ---
+    let read_receipt = Message::ReadReceipt { from: String::new(), room: "#general".to_string(), up_to_timestamp: 424242 };
+    let frame = encode_encrypted(&read_receipt, &mut session_a, "test-a", 3);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let received = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("B: expected ReadReceipt, got {:?}", other),
+    };
+    match decode_encrypted(&received, &mut session_b).expect("B decrypt ReadReceipt") {
+        Message::ReadReceipt { from, room, up_to_timestamp } => {
+            assert_eq!(from, peer_a);
+            assert_eq!(room, "#general");
+            assert_eq!(up_to_timestamp, 424242);
+        }
+        other => panic!("B: expected ReadReceipt, got {:?}", other),
+    }
+
+    // --- A sends a DM typing indicator to B ---
+    let typing_dm = Message::TypingDm { from: String::new(), to: peer_b.clone() };
+    let frame = encode_encrypted(&typing_dm, &mut session_a, "test-a", 4);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let received = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("B: expected TypingDm, got {:?}", other),
+    };
+    match decode_encrypted(&received, &mut session_b).expect("B decrypt TypingDm") {
+        Message::TypingDm { from, .. } => assert_eq!(from, peer_a),
+        other => panic!("B: expected TypingDm, got {:?}", other),
+    }
+
+    // --- A sends a DM read receipt to B ---
+    let read_receipt_dm = Message::ReadReceiptDm { from: String::new(), to: peer_b.clone(), up_to_timestamp: 99 };
+    let frame = encode_encrypted(&read_receipt_dm, &mut session_a, "test-a", 5);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let received = match read_b.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("B: expected ReadReceiptDm, got {:?}", other),
+    };
+    match decode_encrypted(&received, &mut session_b).expect("B decrypt ReadReceiptDm") {
+        Message::ReadReceiptDm { from, up_to_timestamp, .. } => {
+            assert_eq!(from, peer_a);
+            assert_eq!(up_to_timestamp, 99);
+        }
+        other => panic!("B: expected ReadReceiptDm, got {:?}", other),
+    }
+
+    // --- TypingDm to a nonexistent peer is silently dropped: the very next
+    // thing A receives is the Pong for a Ping sent right after, not a
+    // "no such peer" System notice. ---
+    let bogus_typing = Message::TypingDm { from: String::new(), to: "no-such-peer".to_string() };
+    let frame = encode_encrypted(&bogus_typing, &mut session_a, "test-a", 6);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let frame = encode_encrypted(&Message::Ping, &mut session_a, "test-a", 7);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let received = match read_a.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("A: expected Pong, got {:?}", other),
+    };
+    match decode_encrypted(&received, &mut session_a).expect("A decrypt Pong") {
+        Message::Pong => {}
+        other => panic!("A: expected Pong (no error for bogus TypingDm), got {:?}", other),
+    }
+
+    // --- ReadReceiptDm to a nonexistent peer DOES report routing failure,
+    // same as Dm. ---
+    let bogus_receipt = Message::ReadReceiptDm { from: String::new(), to: "no-such-peer".to_string(), up_to_timestamp: 1 };
+    let frame = encode_encrypted(&bogus_receipt, &mut session_a, "test-a", 8);
+    write_a.send(WsMessage::Text(frame)).await.unwrap();
+    let received = match read_a.next().await.unwrap().unwrap() {
+        WsMessage::Text(t) => t,
+        other => panic!("A: expected a System response, got {:?}", other),
+    };
+    match decode_encrypted(&received, &mut session_a).expect("A decrypt no-such-peer notice") {
+        Message::System { body } => assert_eq!(body, "no such peer: no-such-peer"),
+        other => panic!("A: expected System(no such peer), got {:?}", other),
+    }
+}
