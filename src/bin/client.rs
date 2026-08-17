@@ -30,6 +30,8 @@ struct ClientState {
     ratchet_identity: RatchetIdentity,
     ratchet_sessions: HashMap<String, RatchetSession>,
     wallet_identity: WalletIdentity,
+    /// Room plain-text chat is addressed to; changed by `/room`.
+    current_room: String,
     seq: u64,
 }
 
@@ -52,7 +54,17 @@ async fn main() {
     let mnemonic = std::env::var("ETHERHIVE_MNEMONIC").ok();
 
     println!("etherhive-client :: connecting to {ws_url}...");
-    let (ws, _) = tokio_tungstenite::connect_async(&ws_url).await.expect("failed to connect to ircd");
+    // This client speaks to whatever relay the user points it at -- a
+    // hostile, buggy, or just plain absent server is a realistic condition,
+    // not a hypothetical, so every step of the handshake below fails
+    // cleanly instead of panicking with a raw Rust backtrace.
+    let (ws, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: could not connect to {ws_url}: {e}");
+            std::process::exit(1);
+        }
+    };
     let (mut write, mut read) = ws.split();
 
     // X25519 transport handshake (phase 0): read the server's pubkey, send ours.
@@ -62,14 +74,33 @@ async fn main() {
             arr.copy_from_slice(&b);
             x25519_dalek::PublicKey::from(arr)
         }
-        other => panic!("expected the server's transport pubkey, got {other:?}"),
+        None => {
+            eprintln!("error: {ws_url} closed the connection before completing the handshake");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("error: {ws_url} didn't speak the expected transport handshake (wrong server?)");
+            std::process::exit(1);
+        }
     };
     let mut session = CryptoSession::new();
-    write.send(WsMessage::Binary(session.public_key_bytes().to_vec())).await.expect("send pubkey");
-    session.exchange(&server_pub, false).expect("transport key exchange failed");
+    if let Err(e) = write.send(WsMessage::Binary(session.public_key_bytes().to_vec())).await {
+        eprintln!("error: failed to send transport pubkey: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = session.exchange(&server_pub, false) {
+        eprintln!("error: transport key exchange failed: {e}");
+        std::process::exit(1);
+    }
 
     let wallet_identity = match &mnemonic {
-        Some(phrase) => WalletIdentity::from_mnemonic(phrase, 0).expect("invalid mnemonic"),
+        Some(phrase) => match WalletIdentity::from_mnemonic(phrase, 0) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("error: invalid ETHERHIVE_MNEMONIC: {e}");
+                std::process::exit(1);
+            }
+        },
         None => WalletIdentity::generate(),
     };
     println!("wallet address: {:#x}", wallet_identity.address());
@@ -78,11 +109,18 @@ async fn main() {
         ratchet_identity: RatchetIdentity::generate(),
         ratchet_sessions: HashMap::new(),
         wallet_identity,
+        current_room: "#general".to_string(),
         seq: 0,
     };
 
     // Consume the "connected as <peer_id>" welcome.
-    let welcome = read_encrypted(&mut read, &mut session).await.expect("no welcome from server");
+    let welcome = match read_encrypted(&mut read, &mut session).await {
+        Some(msg) => msg,
+        None => {
+            eprintln!("error: {ws_url} closed the connection before sending a welcome");
+            std::process::exit(1);
+        }
+    };
     let peer_id = match &welcome {
         Message::System { body } => body.strip_prefix("connected as ").unwrap_or(body).to_string(),
         other => {
@@ -134,9 +172,15 @@ async fn main() {
                         println!("*** connection closed by server");
                         break;
                     }
-                    Some(Err(_)) => break,
+                    Some(Err(e)) => {
+                        println!("*** connection error: {e}");
+                        break;
+                    }
                     _ => {}
                 }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                break;
             }
         }
     }
@@ -147,7 +191,9 @@ async fn main() {
 async fn send(write: &mut WsWrite, session: &mut CryptoSession, seq: &mut u64, msg: &Message) {
     *seq += 1;
     let frame = encode_encrypted(msg, session, "client", *seq);
-    let _ = write.send(WsMessage::Text(frame)).await;
+    if let Err(e) = write.send(WsMessage::Text(frame)).await {
+        println!("*** send failed: {e}");
+    }
 }
 
 /// Read exactly one message, decrypting the transport layer. `None` if the
@@ -236,13 +282,14 @@ async fn handle_command(
         "/help" => {
             println!(
                 "/room <name>        join a room\n\
-                 <text>              send to the current room (#general by default)\n\
+                 <text>              send to the current room ({} right now)\n\
                  /msg <peer> <text>  transport-encrypted DM (server can see it)\n\
                  /dm <target> <text> real E2E DM (ratchet) — target: peer_id or ENS name\n\
                  /login <ens.eth>    prove wallet ownership of an ENS name (shared login)\n\
                  /whoami             show my peer_id and wallet address\n\
                  /help               this help\n\
-                 /quit               disconnect"
+                 /quit, /exit        disconnect",
+                state.current_room
             );
         }
 
@@ -252,6 +299,7 @@ async fn handle_command(
 
         "/room" => {
             let room = parts.get(1).unwrap_or(&"#general").to_string();
+            state.current_room = room.clone();
             send(write, session, &mut state.seq, &Message::Join { from: String::new(), room }).await;
         }
 
@@ -287,6 +335,7 @@ async fn handle_command(
             };
             let msg = Message::Dm { from: String::new(), to: target.to_string(), body: body.to_string() };
             send(write, session, &mut state.seq, &msg).await;
+            println!("[msg to {target}] {body}");
         }
 
         "/dm" => {
@@ -298,9 +347,14 @@ async fn handle_command(
             send_e2e(write, read, session, state, target, body).await;
         }
 
+        _ if line.starts_with('/') => {
+            println!("*** unknown command: {} (try /help)", parts[0]);
+        }
+
         _ => {
-            let msg = Message::Text { from: String::new(), room: "#general".to_string(), body: line.clone() };
+            let msg = Message::Text { from: String::new(), room: state.current_room.clone(), body: line.clone() };
             send(write, session, &mut state.seq, &msg).await;
+            println!("[{}] <you> {}", state.current_room, line);
         }
     }
     true
@@ -328,24 +382,39 @@ async fn send_e2e(
             Ok(wire) => {
                 let msg = Message::Ratchet { from: String::new(), to: target.to_string(), wire };
                 send(write, session, &mut state.seq, &msg).await;
+                println!("[e2e to {target}] {body}");
             }
             Err(e) => println!("*** encrypt failed: {e}"),
         }
         return;
     }
 
+    println!("*** establishing encrypted session with {target}...");
     let request = Message::PrekeyBundleRequest { from: String::new(), target: target.to_string() };
     send(write, session, &mut state.seq, &request).await;
 
-    let Some(bundle) = wait_for_bundle(read, session, state, target).await else {
-        println!("*** {target} hasn't published a prekey bundle (are they online?)");
-        return;
+    let bundle = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        wait_for_bundle(read, session, state, target),
+    )
+    .await
+    {
+        Ok(Some(bundle)) => bundle,
+        Ok(None) => {
+            println!("*** {target} hasn't published a prekey bundle (are they online?)");
+            return;
+        }
+        Err(_) => {
+            println!("*** timed out waiting for {target}'s session bundle (are they online?)");
+            return;
+        }
     };
 
     match state.ratchet_identity.initiate(&bundle, body.as_bytes()) {
         Ok((new_session, wire)) => {
             let msg = Message::Ratchet { from: String::new(), to: target.to_string(), wire };
             send(write, session, &mut state.seq, &msg).await;
+            println!("[e2e to {target}] {body}");
             state.ratchet_sessions.insert(target.to_string(), new_session);
         }
         Err(e) => println!("*** session bootstrap failed: {e}"),
