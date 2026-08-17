@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -33,12 +34,22 @@ type PrekeyBundles = Arc<Mutex<HashMap<String, PreKeyBundle>>>;
 /// (ephemeral, un-walleted-default) peer_id — ULTRAPLAN phase 3 "shared
 /// login". Un-walleted connections are unaffected; this is additive.
 type AuthenticatedNames = Arc<Mutex<HashMap<String, String>>>;
+/// uuid -> (ens_name, issued_at). Populated by `AuthChallengeRequest`,
+/// consumed (removed) by a matching `AuthLogin` -- this is what closes the
+/// gap `etherhive_auth::auth::verify_challenge`'s own doc comment flags:
+/// the crate is stateless and can verify a signature is fresh and correct,
+/// but only the caller can refuse to accept the *same* valid signature
+/// twice. Entries older than `AUTH_MAX_AGE_SECS` are swept lazily on each
+/// new request so an attacker spamming unredeemed challenges doesn't grow
+/// this map forever.
+type PendingChallenges = Arc<Mutex<HashMap<Uuid, (String, u64)>>>;
 type WsSink = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, WsMessage>;
 
-/// How long an AuthLogin challenge's timestamp stays within the replay
-/// window (see etherhive_auth::auth::verify_challenge's own caveat: this
-/// bounds how long a captured signature stays replayable, not full replay
-/// prevention within the window).
+/// How long a server-issued AuthChallenge stays redeemable, and (per
+/// `verify_challenge`) how far its timestamp may drift from "now". Combined
+/// with `PendingChallenges` consuming the uuid on first use, a captured
+/// `(challenge, signature)` pair is no longer replayable at all -- not just
+/// bounded to this window.
 const AUTH_MAX_AGE_SECS: u64 = 300;
 
 /// Default RPC endpoint for ENS ownership lookups — a public node, no API
@@ -71,6 +82,7 @@ async fn main() {
     let ws_peers: WsPeers = Arc::new(Mutex::new(HashMap::new()));
     let prekey_bundles: PrekeyBundles = Arc::new(Mutex::new(HashMap::new()));
     let authenticated_names: AuthenticatedNames = Arc::new(Mutex::new(HashMap::new()));
+    let pending_challenges: PendingChallenges = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!("etherhive-ircd v2.1 :: quantum-proof messaging");
     eprintln!("  legacy TCP  (plaintext, back-compat) :: 127.0.0.1:{}", port);
@@ -96,6 +108,7 @@ async fn main() {
         ws_peers.clone(),
         prekey_bundles.clone(),
         authenticated_names.clone(),
+        pending_challenges.clone(),
         rpc_url.clone(),
     ));
 
@@ -335,6 +348,7 @@ async fn run_ws_listener(
     ws_peers: WsPeers,
     prekey_bundles: PrekeyBundles,
     authenticated_names: AuthenticatedNames,
+    pending_challenges: PendingChallenges,
     rpc_url: Arc<str>,
 ) {
     let addr = format!("127.0.0.1:{}", port);
@@ -352,6 +366,7 @@ async fn run_ws_listener(
             ws_peers.clone(),
             prekey_bundles.clone(),
             authenticated_names.clone(),
+            pending_challenges.clone(),
             rpc_url.clone(),
         ));
     }
@@ -371,6 +386,7 @@ async fn handle_ws_client(
     ws_peers: WsPeers,
     prekey_bundles: PrekeyBundles,
     authenticated_names: AuthenticatedNames,
+    pending_challenges: PendingChallenges,
     rpc_url: Arc<str>,
 ) {
     let addr: SocketAddr = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
@@ -419,7 +435,7 @@ async fn handle_ws_client(
                     Some(Ok(WsMessage::Text(text))) => {
                         if !rl.lock().unwrap().allow(&peer_id) { continue; }
                         let Some(msg) = decode_encrypted(&text, &mut session) else { continue };
-                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &authenticated_names, &rpc_url, &mut write, &mut session, &mut seq).await;
+                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &authenticated_names, &pending_challenges, &rpc_url, &mut write, &mut session, &mut seq).await;
                     }
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -444,6 +460,7 @@ async fn handle_ws_message(
     ws_peers: &WsPeers,
     prekey_bundles: &PrekeyBundles,
     authenticated_names: &AuthenticatedNames,
+    pending_challenges: &PendingChallenges,
     rpc_url: &str,
     write: &mut WsSink,
     session: &mut CryptoSession,
@@ -454,22 +471,51 @@ async fn handle_ws_message(
             send_encrypted(write, session, seq, &Message::Pong).await;
         }
 
+        // The server generates the challenge, not the client, and remembers
+        // it as pending-and-single-use -- see PendingChallenges' doc comment.
+        Message::AuthChallengeRequest { ens_name } => {
+            let uuid = Uuid::new_v4();
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            {
+                let mut pending = pending_challenges.lock().unwrap();
+                pending.retain(|_, (_, issued_at)| timestamp.saturating_sub(*issued_at) <= AUTH_MAX_AGE_SECS);
+                pending.insert(uuid, (ens_name, timestamp));
+            }
+            let resp = Message::AuthChallengeIssued { uuid: uuid.to_string(), timestamp };
+            send_encrypted(write, session, seq, &resp).await;
+        }
+
         // ULTRAPLAN phase 3 "shared login": prove ownership of an ENS name
-        // by signing UUID+timestamp, verified against the name's current
-        // owner. Optional — connections that skip this stay on their
-        // default ephemeral peer_id, which keeps working exactly as before.
+        // by signing a server-issued UUID+timestamp, verified against the
+        // name's current owner. Optional — connections that skip this stay
+        // on their default ephemeral peer_id, which keeps working exactly
+        // as before.
         Message::AuthLogin { ens_name, uuid, timestamp, signature } => {
-            let result = authenticate(rpc_url, &ens_name, &uuid, timestamp, &signature).await;
-            let resp = match result {
-                Ok(()) => {
-                    authenticated_names.lock().unwrap().insert(ens_name.clone(), peer_id.to_string());
-                    Message::AuthLoginResult {
-                        ok: true,
-                        route_id: Some(route_id::from_ens_name(&ens_name)),
-                        error: None,
-                    }
+            let redeemed = match uuid.parse::<Uuid>() {
+                Ok(parsed) => {
+                    let mut pending = pending_challenges.lock().unwrap();
+                    matches!(pending.remove(&parsed), Some((issued_ens, issued_ts)) if issued_ens == ens_name && issued_ts == timestamp)
                 }
-                Err(e) => Message::AuthLoginResult { ok: false, route_id: None, error: Some(e) },
+                Err(_) => false,
+            };
+            let resp = if !redeemed {
+                Message::AuthLoginResult {
+                    ok: false,
+                    route_id: None,
+                    error: Some("no matching server-issued challenge -- send AuthChallengeRequest first (it may also have expired or already been used)".to_string()),
+                }
+            } else {
+                match authenticate(rpc_url, &ens_name, &uuid, timestamp, &signature).await {
+                    Ok(()) => {
+                        authenticated_names.lock().unwrap().insert(ens_name.clone(), peer_id.to_string());
+                        Message::AuthLoginResult {
+                            ok: true,
+                            route_id: Some(route_id::from_ens_name(&ens_name)),
+                            error: None,
+                        }
+                    }
+                    Err(e) => Message::AuthLoginResult { ok: false, route_id: None, error: Some(e) },
+                }
             };
             send_encrypted(write, session, seq, &resp).await;
         }

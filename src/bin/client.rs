@@ -224,6 +224,22 @@ async fn wait_for_bundle(
     }
 }
 
+/// Block until the server's `AuthChallengeIssued` for our `/login` request
+/// arrives, handling (not dropping) anything else in the meantime.
+async fn wait_for_challenge(
+    read: &mut WsRead,
+    session: &mut CryptoSession,
+    state: &mut ClientState,
+) -> Option<(String, u64)> {
+    loop {
+        let msg = read_encrypted(read, session).await?;
+        if let Message::AuthChallengeIssued { uuid, timestamp } = msg {
+            return Some((uuid, timestamp));
+        }
+        handle_incoming(msg, state);
+    }
+}
+
 /// Update session state and print one incoming message to the user.
 fn handle_incoming(msg: Message, state: &mut ClientState) {
     match msg {
@@ -308,8 +324,22 @@ async fn handle_command(
                 println!("usage: /login <name.eth>");
                 return true;
             };
-            let uuid = Uuid::new_v4();
-            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            // The server issues the challenge (not us) and only accepts it
+            // once -- signing a self-chosen uuid+timestamp would be
+            // replayable by anyone who captured the signature.
+            let request = Message::AuthChallengeRequest { ens_name: ens_name.to_string() };
+            send(write, session, &mut state.seq, &request).await;
+            let Some((uuid, timestamp)) = wait_for_challenge(read, session, state).await else {
+                println!("*** login failed: no challenge from server (connection closed?)");
+                return true;
+            };
+            let uuid: Uuid = match uuid.parse() {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("*** login failed: server sent an invalid uuid: {e}");
+                    return true;
+                }
+            };
             let challenge = AuthChallenge { uuid, timestamp };
             let signature = match sign_challenge(&state.wallet_identity, &challenge) {
                 Ok(sig) => sig,
