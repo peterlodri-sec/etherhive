@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::crypto::{CryptoSession, Identity};
+use crate::ratchet::{PreKeyBundle, RatchetWireMessage};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Message {
@@ -7,8 +8,22 @@ pub enum Message {
     Text { from: String, room: String, body: String },
     /// Emote (/me)
     Emote { from: String, room: String, action: String },
-    /// Direct message to a single peer (not room-broadcast)
+    /// Direct message to a single peer (not room-broadcast). Transport-
+    /// encrypted only (server decrypts to route) — for real E2E use
+    /// `Ratchet` instead.
     Dm { from: String, to: String, body: String },
+    /// Publish our ratchet prekey bundle so others can start an E2E
+    /// session with us. Public keys only — safe for the server to store
+    /// and relay in the clear.
+    PrekeyBundlePublish { from: String, bundle: PreKeyBundle },
+    /// Ask the server for a peer's published prekey bundle.
+    PrekeyBundleRequest { from: String, target: String },
+    /// Response to `PrekeyBundleRequest` (or an error if none is published).
+    PrekeyBundleResponse { target: String, bundle: Option<PreKeyBundle> },
+    /// A real end-to-end encrypted 1:1 message (phase 2 ratchet). The
+    /// server routes this by `to` alone and never decrypts `wire` — it
+    /// holds no ratchet session for it and structurally cannot.
+    Ratchet { from: String, to: String, wire: RatchetWireMessage },
     /// Honesty vector broadcast (signed)
     Honesty { from: String, vector: String },
     /// Challenge-verify request

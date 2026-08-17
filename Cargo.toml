@@ -41,6 +41,7 @@ hkdf = "0.12"
 libc = "0.2"
 subtle = "2"
 regex-lite = "0.1"
+thiserror = "1"
 
 # WebSocket for IRC-like protocol
 tokio = { version = "1", features = ["full"] }
@@ -50,10 +51,24 @@ futures-util = "0.3"
 # PQC algorithms — RustCrypto, NIST FIPS 203/204/205 final standards
 ml-kem = { version = "0.3.2", features = ["getrandom"] } # FIPS 203 — ML-KEM-1024 (CRYSTALS-Kyber)
 ml-dsa = "0.1.1"    # FIPS 204 — ML-DSA-87 (CRYSTALS-Dilithium)
-slh-dsa = "0.1.0"   # FIPS 205 — SLH-DSA-SHA2-128s (SPHINCS+)
-# slh-dsa 0.1.0 only compiles against signature 2.3.0-pre.4 exactly (newer
-# pre-releases renamed CryptoRngCore); pin the transitive dep to unbreak it.
-signature = "=2.3.0-pre.4"
+# 0.2.0-rc.5, not the stable 0.1.0: 0.1.0 only compiles against signature
+# 2.3.0-pre.4 exactly, which collides with ed25519-dalek's stable
+# signature >=2.0,<2.3 requirement (needed by vodozemac, below) — no single
+# `signature` version can satisfy both. 0.2.0-rc.5 moved to signature 3.x,
+# the same major line ml-dsa already uses, freeing the 2.x line for
+# ed25519-dalek. API is unchanged for the calls pqc.rs makes.
+slh-dsa = "0.2.0-rc.5"   # FIPS 205 — SLH-DSA-SHA2-128s (SPHINCS+)
+# slh-dsa 0.2.0-rc.5's RandomizedSigner needs a rand_core 0.10 CryptoRng —
+# a different generation than rand 0.8's ThreadRng (rand_core 0.6-based).
+# Renamed so it doesn't collide with the `rand = "0.8"` used everywhere
+# else in this crate; used only for this one call site.
+rand10 = { package = "rand", version = "0.10" }
 
-# Note: transport layer is classical X25519 + ChaCha20Poly1305 (crypto.rs).
-# Hybrid mode (ML-KEM + X25519) lands in phase 2 (X3DH/PQXDH-style bootstrap).
+# Real X3DH-style bootstrap + Double Ratchet (Matrix's Olm, audited-quality,
+# actively maintained) — not hand-rolled. Phase 2's hybrid PQ layer wraps
+# this with an ML-KEM-derived outer encryption (see src/ratchet.rs).
+vodozemac = "0.10"
+
+# Note: transport layer (crypto.rs CryptoSession) is classical X25519 +
+# ChaCha20Poly1305, used for the client<->server hop (phase 0). The 1:1
+# ratchet (src/ratchet.rs) is the real peer<->peer E2E layer (phase 2).

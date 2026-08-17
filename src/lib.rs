@@ -10,10 +10,12 @@ pub mod hardening;
 pub mod frozen;
 pub mod discovery;
 pub mod rate;
+pub mod ratchet;
 
 pub use honesty::{HonestyVector, HonestyFields};
 pub use crypto::{Identity, DisplayName, NameRegistry, CryptoSession, route_id};
 pub use irc::{Message, Envelope, Room, IrcDaemon};
+pub use ratchet::{PreKeyBundle, RatchetError, RatchetIdentity, RatchetSession, RatchetWireMessage};
 pub use memory::{SealedMemory, MemoryFortress};
 pub use seed::QuantByteCipher;
 pub use music::{Track, Choreography, MusicClient};

@@ -13,12 +13,17 @@ use etherhive::crypto::{CryptoSession, DisplayName, Identity};
 use etherhive::discovery::{ChatHistory, OverlayNetwork, PeerDiscovery, SearchIndex};
 use etherhive::hardening::{sanitize_body, sanitize_room, strip_egress};
 use etherhive::irc::{decode_encrypted, encode_encrypted, IrcDaemon, Message};
+use etherhive::ratchet::PreKeyBundle;
 use etherhive::rate::RateLimiter;
 
 /// Outbound queue for a connected legacy (plaintext newline) peer.
 type LegacyPeers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>;
 /// Outbound queue for a connected encrypted WebSocket peer.
 type WsPeers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
+/// Published ratchet prekey bundles, keyed by peer_id. Public keys only —
+/// safe for the server to hold; it's never a party to the sessions they
+/// bootstrap.
+type PrekeyBundles = Arc<Mutex<HashMap<String, PreKeyBundle>>>;
 type WsSink = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, WsMessage>;
 
 #[tokio::main]
@@ -44,6 +49,7 @@ async fn main() {
     let _overlay = Arc::new(Mutex::new(OverlayNetwork::new()));
     let legacy_peers: LegacyPeers = Arc::new(Mutex::new(HashMap::new()));
     let ws_peers: WsPeers = Arc::new(Mutex::new(HashMap::new()));
+    let prekey_bundles: PrekeyBundles = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!("etherhive-ircd v2.1 :: quantum-proof messaging");
     eprintln!("  legacy TCP  (plaintext, back-compat) :: 127.0.0.1:{}", port);
@@ -66,6 +72,7 @@ async fn main() {
         history.clone(),
         rl.clone(),
         ws_peers.clone(),
+        prekey_bundles.clone(),
     ));
 
     let _ = tokio::join!(legacy, ws);
@@ -302,6 +309,7 @@ async fn run_ws_listener(
     history: Arc<Mutex<ChatHistory>>,
     rl: Arc<Mutex<RateLimiter>>,
     ws_peers: WsPeers,
+    prekey_bundles: PrekeyBundles,
 ) {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await.expect("failed to bind ws");
@@ -316,6 +324,7 @@ async fn run_ws_listener(
             history.clone(),
             rl.clone(),
             ws_peers.clone(),
+            prekey_bundles.clone(),
         ));
     }
 }
@@ -332,6 +341,7 @@ async fn handle_ws_client(
     history: Arc<Mutex<ChatHistory>>,
     rl: Arc<Mutex<RateLimiter>>,
     ws_peers: WsPeers,
+    prekey_bundles: PrekeyBundles,
 ) {
     let addr: SocketAddr = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
     let peer_id = format!("{}", addr);
@@ -377,7 +387,7 @@ async fn handle_ws_client(
                     Some(Ok(WsMessage::Text(text))) => {
                         if !rl.lock().unwrap().allow(&peer_id) { continue; }
                         let Some(msg) = decode_encrypted(&text, &mut session) else { continue };
-                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &mut write, &mut session, &mut seq).await;
+                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &mut write, &mut session, &mut seq).await;
                     }
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -399,6 +409,7 @@ async fn handle_ws_message(
     daemon: &Arc<Mutex<IrcDaemon>>,
     history: &Arc<Mutex<ChatHistory>>,
     ws_peers: &WsPeers,
+    prekey_bundles: &PrekeyBundles,
     write: &mut WsSink,
     session: &mut CryptoSession,
     seq: &mut u64,
@@ -406,6 +417,35 @@ async fn handle_ws_message(
     match msg {
         Message::Ping => {
             send_encrypted(write, session, seq, &Message::Pong).await;
+        }
+
+        Message::PrekeyBundlePublish { bundle, .. } => {
+            prekey_bundles.lock().unwrap().insert(peer_id.to_string(), bundle);
+            // Acknowledge so a client (or a test) can know the bundle is
+            // actually discoverable before telling anyone else about it —
+            // publishing is a fire-and-forget send otherwise, with nothing
+            // to stop a request for it from racing ahead of the server
+            // actually having stored it.
+            let ack = Message::System { body: "prekey bundle published".to_string() };
+            send_encrypted(write, session, seq, &ack).await;
+        }
+
+        Message::PrekeyBundleRequest { target, .. } => {
+            let bundle = prekey_bundles.lock().unwrap().get(&target).cloned();
+            let resp = Message::PrekeyBundleResponse { target, bundle };
+            send_encrypted(write, session, seq, &resp).await;
+        }
+
+        // Real E2E: the server never touches `wire` beyond routing it —
+        // it holds no ratchet session and structurally cannot decrypt it.
+        Message::Ratchet { to, wire, .. } => {
+            let out = Message::Ratchet { from: peer_id.to_string(), to: to.clone(), wire };
+            let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
+            let sent = target_tx.map(|tx| tx.send(out).is_ok()).unwrap_or(false);
+            if !sent {
+                let notice = Message::System { body: format!("no such peer: {}", to) };
+                send_encrypted(write, session, seq, &notice).await;
+            }
         }
 
         Message::Dm { to, body, .. } => {

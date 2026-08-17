@@ -9,7 +9,8 @@ use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem1024};
 use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport as KemKeyExport, TryKeyInit};
 use ml_dsa::{EncodedSignature, EncodedVerifyingKey, Generate, Keypair, MlDsa87, Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use slh_dsa::{Sha2_128s, Signature as SlhSignature, SigningKey as SlhSigningKey, VerifyingKey as SlhVerifyingKey};
-use slh_dsa::signature::{Keypair as SlhKeypair, RandomizedSigner, Verifier as SlhVerifier};
+use slh_dsa::signature::RandomizedSigner;
+use rand10::rngs::ThreadRng;
 
 /// ML-KEM-1024 (CRYSTALS-Kyber) Key Encapsulation Mechanism.
 /// Post-quantum secure.
@@ -29,20 +30,28 @@ impl KyberKeypair {
     }
 
     /// Encapsulate a shared secret using the recipient's public key.
-    /// Returns (ciphertext, shared_secret).
-    pub fn encapsulate(pk: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    /// Returns (ciphertext, shared_secret). `pk` may be attacker/peer
+    /// controlled (e.g. a published prekey bundle) — malformed input is a
+    /// normal, expected case, not a bug, so this returns `Result` rather
+    /// than panicking.
+    pub fn encapsulate(pk: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         let ek = EncapsulationKey::<MlKem1024>::new_from_slice(pk)
-            .expect("invalid ML-KEM-1024 public key");
+            .map_err(|_| "invalid ML-KEM-1024 public key".to_string())?;
         let (ct, ss) = ek.encapsulate();
-        (ct.to_vec(), ss.to_vec())
+        Ok((ct.to_vec(), ss.to_vec()))
     }
 
-    /// Decapsulate a shared secret using our secret key.
-    pub fn decapsulate(&self, ct: &[u8]) -> Vec<u8> {
+    /// Decapsulate a shared secret using our secret key. `ct` may be
+    /// attacker/peer controlled (received over the wire) — malformed input
+    /// is a normal, expected case, not a bug, so this returns `Result`
+    /// rather than panicking (a panic here would be a remote DoS: any peer
+    /// could crash the task handling their session by sending a
+    /// wrong-length ciphertext).
+    pub fn decapsulate(&self, ct: &[u8]) -> Result<Vec<u8>, String> {
         self.decap_key
             .decapsulate_slice(ct)
-            .expect("invalid ML-KEM-1024 ciphertext")
-            .to_vec()
+            .map(|ss| ss.to_vec())
+            .map_err(|_| "invalid ML-KEM-1024 ciphertext".to_string())
     }
 }
 
@@ -89,8 +98,7 @@ pub struct SphincsKeypair {
 impl SphincsKeypair {
     /// Generate a new SLH-DSA-SHA2-128s keypair.
     pub fn generate() -> Self {
-        let mut rng = rand::thread_rng();
-        let signing_key = SlhSigningKey::<Sha2_128s>::new(&mut rng);
+        let signing_key = SlhSigningKey::<Sha2_128s>::new(&mut ThreadRng::default());
         let public_key = signing_key.verifying_key().to_vec();
         SphincsKeypair { signing_key, public_key }
     }
@@ -101,8 +109,7 @@ impl SphincsKeypair {
 
     /// Sign a message.
     pub fn sign(&self, message: &[u8]) -> Vec<u8> {
-        let mut rng = rand::thread_rng();
-        self.signing_key.sign_with_rng(&mut rng, message).to_vec()
+        self.signing_key.sign_with_rng(&mut ThreadRng::default(), message).to_vec()
     }
 
     /// Verify a signature.
@@ -144,9 +151,19 @@ mod tests {
     #[test]
     fn test_kyber_encapsulate_decapsulate() {
         let kp = KyberKeypair::generate();
-        let (ct, ss_enc) = KyberKeypair::encapsulate(&kp.public_key);
-        let ss_dec = kp.decapsulate(&ct);
+        let (ct, ss_enc) = KyberKeypair::encapsulate(&kp.public_key).unwrap();
+        let ss_dec = kp.decapsulate(&ct).unwrap();
         assert_eq!(ss_enc, ss_dec); // real KEM: shared secrets must match
+    }
+
+    #[test]
+    fn test_kyber_rejects_malformed_input_without_panicking() {
+        // Both public key and ciphertext bytes can arrive over the wire
+        // from a peer — wrong-length input must fail cleanly, not panic
+        // (a panic here would be a remote DoS).
+        assert!(KyberKeypair::encapsulate(b"too short").is_err());
+        let kp = KyberKeypair::generate();
+        assert!(kp.decapsulate(b"too short").is_err());
     }
 
     #[test]
