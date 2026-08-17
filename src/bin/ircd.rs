@@ -15,6 +15,10 @@ use etherhive::hardening::{sanitize_body, sanitize_room, strip_egress};
 use etherhive::irc::{decode_encrypted, encode_encrypted, IrcDaemon, Message};
 use etherhive::ratchet::PreKeyBundle;
 use etherhive::rate::RateLimiter;
+use etherhive_auth::alloy::providers::ProviderBuilder;
+use etherhive_auth::alloy::primitives::Signature as WalletSignature;
+use etherhive_auth::uuid::Uuid;
+use etherhive_auth::{route_id, AuthChallenge};
 
 /// Outbound queue for a connected legacy (plaintext newline) peer.
 type LegacyPeers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>>;
@@ -24,13 +28,29 @@ type WsPeers = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
 /// safe for the server to hold; it's never a party to the sessions they
 /// bootstrap.
 type PrekeyBundles = Arc<Mutex<HashMap<String, PreKeyBundle>>>;
+/// ens_name -> peer_id, for connections that completed `AuthLogin`. Lets
+/// `/msg`-style targets be addressed by ENS name instead of only the raw
+/// (ephemeral, un-walleted-default) peer_id — ULTRAPLAN phase 3 "shared
+/// login". Un-walleted connections are unaffected; this is additive.
+type AuthenticatedNames = Arc<Mutex<HashMap<String, String>>>;
 type WsSink = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, WsMessage>;
+
+/// How long an AuthLogin challenge's timestamp stays within the replay
+/// window (see etherhive_auth::auth::verify_challenge's own caveat: this
+/// bounds how long a captured signature stays replayable, not full replay
+/// prevention within the window).
+const AUTH_MAX_AGE_SECS: u64 = 300;
+
+/// Default RPC endpoint for ENS ownership lookups — a public node, no API
+/// key needed. Override with a 3rd CLI arg for production use.
+const DEFAULT_RPC_URL: &str = "https://ethereum-rpc.publicnode.com";
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let port: u16 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(9667);
     let ws_port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(port + 1);
+    let rpc_url: Arc<str> = args.get(3).cloned().unwrap_or_else(|| DEFAULT_RPC_URL.to_string()).into();
 
     let identity = Identity {
         route_id: "0000000000000000".into(),
@@ -50,10 +70,12 @@ async fn main() {
     let legacy_peers: LegacyPeers = Arc::new(Mutex::new(HashMap::new()));
     let ws_peers: WsPeers = Arc::new(Mutex::new(HashMap::new()));
     let prekey_bundles: PrekeyBundles = Arc::new(Mutex::new(HashMap::new()));
+    let authenticated_names: AuthenticatedNames = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!("etherhive-ircd v2.1 :: quantum-proof messaging");
     eprintln!("  legacy TCP  (plaintext, back-compat) :: 127.0.0.1:{}", port);
     eprintln!("  encrypted WS (X25519 + ChaCha20Poly1305, Envelope-wrapped) :: 127.0.0.1:{}", ws_port);
+    eprintln!("  ENS auth RPC :: {}", rpc_url);
     eprintln!("  DM=private(1:1)  Group=public(searchable)");
     eprintln!("  commands: /msg /room /leave /honesty /verify /music /quant /search /help");
 
@@ -73,6 +95,8 @@ async fn main() {
         rl.clone(),
         ws_peers.clone(),
         prekey_bundles.clone(),
+        authenticated_names.clone(),
+        rpc_url.clone(),
     ));
 
     let _ = tokio::join!(legacy, ws);
@@ -310,6 +334,8 @@ async fn run_ws_listener(
     rl: Arc<Mutex<RateLimiter>>,
     ws_peers: WsPeers,
     prekey_bundles: PrekeyBundles,
+    authenticated_names: AuthenticatedNames,
+    rpc_url: Arc<str>,
 ) {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await.expect("failed to bind ws");
@@ -325,6 +351,8 @@ async fn run_ws_listener(
             rl.clone(),
             ws_peers.clone(),
             prekey_bundles.clone(),
+            authenticated_names.clone(),
+            rpc_url.clone(),
         ));
     }
 }
@@ -342,6 +370,8 @@ async fn handle_ws_client(
     rl: Arc<Mutex<RateLimiter>>,
     ws_peers: WsPeers,
     prekey_bundles: PrekeyBundles,
+    authenticated_names: AuthenticatedNames,
+    rpc_url: Arc<str>,
 ) {
     let addr: SocketAddr = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
     let peer_id = format!("{}", addr);
@@ -387,7 +417,7 @@ async fn handle_ws_client(
                     Some(Ok(WsMessage::Text(text))) => {
                         if !rl.lock().unwrap().allow(&peer_id) { continue; }
                         let Some(msg) = decode_encrypted(&text, &mut session) else { continue };
-                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &mut write, &mut session, &mut seq).await;
+                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &authenticated_names, &rpc_url, &mut write, &mut session, &mut seq).await;
                     }
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -398,6 +428,7 @@ async fn handle_ws_client(
     }
 
     ws_peers.lock().unwrap().remove(&peer_id);
+    authenticated_names.lock().unwrap().retain(|_, v| v != &peer_id);
 }
 
 /// Dispatch one decrypted `Message` from a WS peer. The sender's `from` field
@@ -410,6 +441,8 @@ async fn handle_ws_message(
     history: &Arc<Mutex<ChatHistory>>,
     ws_peers: &WsPeers,
     prekey_bundles: &PrekeyBundles,
+    authenticated_names: &AuthenticatedNames,
+    rpc_url: &str,
     write: &mut WsSink,
     session: &mut CryptoSession,
     seq: &mut u64,
@@ -417,6 +450,26 @@ async fn handle_ws_message(
     match msg {
         Message::Ping => {
             send_encrypted(write, session, seq, &Message::Pong).await;
+        }
+
+        // ULTRAPLAN phase 3 "shared login": prove ownership of an ENS name
+        // by signing UUID+timestamp, verified against the name's current
+        // owner. Optional — connections that skip this stay on their
+        // default ephemeral peer_id, which keeps working exactly as before.
+        Message::AuthLogin { ens_name, uuid, timestamp, signature } => {
+            let result = authenticate(rpc_url, &ens_name, &uuid, timestamp, &signature).await;
+            let resp = match result {
+                Ok(()) => {
+                    authenticated_names.lock().unwrap().insert(ens_name.clone(), peer_id.to_string());
+                    Message::AuthLoginResult {
+                        ok: true,
+                        route_id: Some(route_id::from_ens_name(&ens_name)),
+                        error: None,
+                    }
+                }
+                Err(e) => Message::AuthLoginResult { ok: false, route_id: None, error: Some(e) },
+            };
+            send_encrypted(write, session, seq, &resp).await;
         }
 
         Message::PrekeyBundlePublish { bundle, .. } => {
@@ -431,6 +484,7 @@ async fn handle_ws_message(
         }
 
         Message::PrekeyBundleRequest { target, .. } => {
+            let target = resolve_target(&target, authenticated_names);
             let bundle = prekey_bundles.lock().unwrap().get(&target).cloned();
             let resp = Message::PrekeyBundleResponse { target, bundle };
             send_encrypted(write, session, seq, &resp).await;
@@ -439,6 +493,7 @@ async fn handle_ws_message(
         // Real E2E: the server never touches `wire` beyond routing it —
         // it holds no ratchet session and structurally cannot decrypt it.
         Message::Ratchet { to, wire, .. } => {
+            let to = resolve_target(&to, authenticated_names);
             let out = Message::Ratchet { from: peer_id.to_string(), to: to.clone(), wire };
             let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
             let sent = target_tx.map(|tx| tx.send(out).is_ok()).unwrap_or(false);
@@ -449,6 +504,7 @@ async fn handle_ws_message(
         }
 
         Message::Dm { to, body, .. } => {
+            let to = resolve_target(&to, authenticated_names);
             history.lock().unwrap().append(peer_id, &body);
             let out = Message::Dm { from: peer_id.to_string(), to: to.clone(), body };
             let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
@@ -497,4 +553,30 @@ async fn handle_ws_message(
             }
         }
     }
+}
+
+/// If `target` is a registered ENS name, resolve it to the peer_id it's
+/// currently authenticated as; otherwise assume it's already a peer_id
+/// (the un-walleted default addressing scheme, unchanged from phase 0).
+fn resolve_target(target: &str, authenticated_names: &AuthenticatedNames) -> String {
+    authenticated_names.lock().unwrap().get(target).cloned().unwrap_or_else(|| target.to_string())
+}
+
+/// Verify an `AuthLogin` attempt: parse the client-supplied UUID and
+/// signature, look up `ens_name`'s current owner over `rpc_url`, and check
+/// the signature recovers to that owner within the replay window. Returns
+/// a human-readable error string on any failure (bad input, RPC failure,
+/// signature mismatch) rather than ever panicking on client-supplied data.
+async fn authenticate(rpc_url: &str, ens_name: &str, uuid: &str, timestamp: u64, signature: &[u8]) -> Result<(), String> {
+    let uuid: Uuid = uuid.parse().map_err(|e| format!("invalid uuid: {e}"))?;
+    let signature = WalletSignature::try_from(signature).map_err(|e| format!("invalid signature: {e}"))?;
+    let challenge = AuthChallenge { uuid, timestamp };
+
+    let rpc_url = rpc_url.parse().map_err(|e| format!("invalid RPC URL: {e}"))?;
+    let provider = ProviderBuilder::new().connect_http(rpc_url);
+    let owner = etherhive_auth::resolve_owner(&provider, ens_name).await.map_err(|e| e.to_string())?;
+
+    etherhive_auth::verify_challenge(&challenge, &signature, owner, AUTH_MAX_AGE_SECS)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }

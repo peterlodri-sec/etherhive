@@ -15,3 +15,10 @@ pub mod siwe;
 pub use auth::{sign_challenge, verify_challenge, AuthChallenge, AuthError};
 pub use ens::{resolve_owner, EnsError, ENS_NAME_WRAPPER, ENS_REGISTRY};
 pub use keys::Identity;
+
+/// Re-exported so downstream crates (e.g. the ircd) can build an
+/// `alloy::providers::Provider` for `ens::resolve_owner` without pinning
+/// their own separate `alloy` dependency that could drift out of sync.
+pub use alloy;
+pub use alloy_ens;
+pub use uuid;

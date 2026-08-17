@@ -72,3 +72,17 @@ vodozemac = "0.10"
 # Note: transport layer (crypto.rs CryptoSession) is classical X25519 +
 # ChaCha20Poly1305, used for the client<->server hop (phase 0). The 1:1
 # ratchet (src/ratchet.rs) is the real peer<->peer E2E layer (phase 2).
+
+# Wallet + ENS identity (phase 1), wired into the real ircd login flow
+# (phase 3 "shared login"). Was standalone with its own Cargo.lock during
+# phase 1 specifically to dodge the slh-dsa signature-crate pin conflict;
+# now that slh-dsa is on 0.2.0-rc.5 (see above) that conflict is gone, so
+# it can be a real path dependency.
+etherhive-auth = { path = "etherhive-auth" }
+
+[dev-dependencies]
+# anvil-api: only needed by the anvil-fork integration tests (impersonation
+# cheat codes). Declared here (not [dependencies]) to keep it out of
+# production builds; Cargo unifies this feature into the shared `alloy`
+# instance etherhive-auth also depends on when building this crate's tests.
+alloy = { version = "2.4.1", features = ["provider-anvil-api"] }

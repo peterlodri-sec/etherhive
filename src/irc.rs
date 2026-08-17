@@ -24,6 +24,14 @@ pub enum Message {
     /// server routes this by `to` alone and never decrypts `wire` — it
     /// holds no ratchet session for it and structurally cannot.
     Ratchet { from: String, to: String, wire: RatchetWireMessage },
+    /// Prove wallet+ENS identity ownership (ULTRAPLAN phase 3 "shared
+    /// login") — Arnacon-compatible: sign UUID+timestamp, the server
+    /// verifies against the name's current ENS owner. Optional: connections
+    /// that never send this stay on the default ephemeral, un-walleted
+    /// identity, which remains fully supported.
+    AuthLogin { ens_name: String, uuid: String, timestamp: u64, signature: Vec<u8> },
+    /// Response to `AuthLogin`.
+    AuthLoginResult { ok: bool, route_id: Option<String>, error: Option<String> },
     /// Honesty vector broadcast (signed)
     Honesty { from: String, vector: String },
     /// Challenge-verify request
