@@ -9,6 +9,27 @@
 
 ---
 
+## What's actually running vs. what's designed here
+
+This document is a **design doc**, not a description of the running
+binaries -- an external review ([#1](https://github.com/peterlodri-sec/etherhive/issues/1))
+found that most of it was being read as the latter. Layer by layer:
+
+| Layer | Live in `etherhive-ircd` / `etherhive-client` today? |
+|-------|-------------------------------------------------------|
+| Layer -2 (SSH multihop init) | No -- design only, no code path calls this |
+| Layer -1 (memfd/mlock/sealed memory) | No -- `src/memory.rs` exists and has tests, but nothing in `main.rs`/`ircd.rs`/`client.rs` calls it. Chat lives in an ordinary `HashMap`/`Vec`/`Mutex`. |
+| Layer 0 (`etherhive-vpn`, Mullvad) | No -- `etherhive-vpn` prints `[OK] tunnel established (simulated)` and exits |
+| Layer 1 (`etherhive-crypt`, per-byte LLM sub-keys) | No -- `etherhive-crypt` doesn't wrap traffic; `src/seed.rs`'s cipher is unauthenticated XOR with no nonce, not the HKDF+CSPRNG scheme documented below |
+| Layer 2 (`etherhive-mesh`, Tailscale/Headscale) | No -- `etherhive-mesh` prints `[OK] mesh joined (simulated)` and exits |
+| Layer 3 (`etherhive-ircd`, transport) | **Yes**, but as X25519 + ChaCha20Poly1305 directly (not "encrypted per-byte, stored in sealed memory" as stated below) -- see `src/crypto.rs`. Had a real nonce-reuse bug, fixed in [#2](https://github.com/peterlodri-sec/etherhive/pull/2). |
+| 1:1 E2E (not a layer below, but the one that's real) | **Yes** -- `/dm` in the TUI client runs X3DH + Double Ratchet + ML-KEM-1024 hybrid (`src/ratchet.rs`). This is the one part of the crypto story that matches its claims. |
+
+If you're evaluating whether to trust this for something sensitive: trust
+the transport layer and `/dm`, and nothing else on this page yet.
+
+---
+
 ## Layer -2: Multihop SSH Throwaway Init (RAM-only)
 
 Before any sidecar starts, the connection is bootstrapped through
@@ -226,6 +247,11 @@ a cryptographic defense — it is a social/behavioral trust mechanism.
 ---
 
 ## Threat Model
+
+This table describes the design's intended defenses. Per the status table
+above, most rows below assume layers (VPN, mesh, per-byte LLM crypto,
+sealed memory, SSH multihop) that are not currently wired into the running
+daemon -- treat this as the target threat model, not the current one.
 
 | Attack | Defense |
 |--------|---------|
