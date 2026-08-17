@@ -23,10 +23,12 @@ found that most of it was being read as the latter. Layer by layer:
 | Layer 1 (`etherhive-crypt`, per-byte LLM sub-keys) | No -- `etherhive-crypt` doesn't wrap traffic; `src/seed.rs`'s cipher is unauthenticated XOR with no nonce, not the HKDF+CSPRNG scheme documented below |
 | Layer 2 (`etherhive-mesh`, Tailscale/Headscale) | No -- `etherhive-mesh` prints `[OK] mesh joined (simulated)` and exits |
 | Layer 3 (`etherhive-ircd`, transport) | **Yes**, but as X25519 + ChaCha20Poly1305 directly (not "encrypted per-byte, stored in sealed memory" as stated below) -- see `src/crypto.rs`. Had a real nonce-reuse bug, fixed in [#2](https://github.com/peterlodri-sec/etherhive/pull/2). |
-| 1:1 E2E (not a layer below, but the one that's real) | **Yes** -- `/dm` in the TUI client runs X3DH + Double Ratchet + ML-KEM-1024 hybrid (`src/ratchet.rs`). This is the one part of the crypto story that matches its claims. |
+| 1:1 E2E (not a layer below, but the one that's real) | **Yes, with a caveat** -- `/dm` in the TUI client runs X3DH + Double Ratchet + ML-KEM-1024 hybrid (`src/ratchet.rs`), and the server structurally cannot decrypt message content. But `PreKeyBundle` (`src/ratchet.rs`) has no signature field, and the client accepts whatever bundle the server hands back with no pinning (trust-on-first-use extracts the identity key from the incoming message itself, `accept_trust_on_first_use`). A passive server can't read `/dm` traffic; an actively malicious one can substitute its own bundle at session-bootstrap time and MITM the conversation. See finding #8 in [issue #1](https://github.com/peterlodri-sec/etherhive/issues/1). |
 
 If you're evaluating whether to trust this for something sensitive: trust
-the transport layer and `/dm`, and nothing else on this page yet.
+the transport layer and `/dm` against a passive server, and nothing else on
+this page yet -- `/dm`'s unsigned prekey bundle means it does not yet
+protect against an actively malicious server (see the E2E row above).
 
 ---
 
@@ -231,6 +233,11 @@ encrypted per-byte, stored in sealed memory.
 ## Trust Model
 
 ### Honesty-Auth: Identity Through Personality
+
+**Not implemented in the running daemon.** The TUI client has no `/honesty`
+command at all; the legacy-TCP `/honesty` handler returns a hardcoded
+placeholder string (`"not yet configured"`), not a real vector, and nothing
+signs or verifies it. What follows is the design.
 
 No passwords. No OAuth. No email. Identity is a vector of deeply personal
 answers. The trust model relies on the fact that an impostor cannot

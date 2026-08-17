@@ -14,7 +14,9 @@ found a real gap between what these docs claim and what `etherhive-ircd` /
 - **Real and wired in**: X25519 + ChaCha20Poly1305 transport encryption
   (directional keys, fixed in [#2](https://github.com/peterlodri-sec/etherhive/pull/2)
   after the review found a nonce-reuse bug); the `/dm` 1:1 E2E channel
-  (X3DH + Double Ratchet + ML-KEM-1024 hybrid, `src/ratchet.rs`); wallet+ENS
+  (X3DH + Double Ratchet + ML-KEM-1024 hybrid, `src/ratchet.rs`) -- though
+  its prekey bundle bootstrap is unsigned/TOFU, so this holds against a
+  passive server but not an actively malicious one, see below; wallet+ENS
   login (`/login`); real FIPS 203/204/205 PQC primitives as a library
   (`src/pqc.rs`).
 - **NOT wired in, despite the tagline / diagram below**: `etherhive-vpn`,
@@ -22,7 +24,9 @@ found a real gap between what these docs claim and what `etherhive-ircd` /
   success and do nothing); the memory fortress (`src/memory.rs`) is never
   called from the running binaries; per-byte LLM crypto (`src/seed.rs`) is
   unauthenticated XOR, not the HKDF+CSPRNG scheme SECURITY.md describes; SSH
-  multihop init doesn't run automatically.
+  multihop init doesn't run automatically; honesty-auth (`/honesty`) isn't
+  implemented in the TUI client at all, and its legacy-TCP form is a
+  placeholder, not a signed/verified vector.
 - **`/msg` is transport-only, not E2E** — the server decrypts it to route
   and stores the plaintext body in in-memory chat history. Use `/dm` (TUI
   client) for an actually private 1:1 message; see the protocol table below.
@@ -100,14 +104,20 @@ etherhive up
                           server decrypts to route and stores the body;
                           NOT end-to-end. Use /dm for real E2E.)
 /dm <user> <text>         real E2E DM (TUI client only; X3DH + Double
-                          Ratchet + ML-KEM-1024 -- server never sees
-                          plaintext)
+                          Ratchet + ML-KEM-1024 -- server can't decrypt
+                          the message content itself, but the prekey
+                          bundle that bootstraps the session is
+                          unsigned and trust-on-first-use, so an
+                          actively malicious server can still MITM
+                          session setup; see SECURITY.md)
 /room <name>              join public room (searchable by all)
 /leave                    leave current room
 /me <action>              emote
 /nick <name>              change display name
-/honesty                  share signed honesty vector
-/verify <user>            challenge-verify a peer
+/honesty                  legacy TCP only, and only a placeholder
+                          ("not yet configured") -- not implemented in
+                          the TUI client, not signed, not verified
+/verify <user>            not implemented anywhere
 /music                    share current music.vaked.dev track
 /quant <seed>             generate shared ternary matrix
 /search <term>            search public group history
@@ -118,7 +128,7 @@ etherhive up
 | layer | what | status |
 |-------|------|--------|
 | TRANSPORT | X25519 + ChaCha20Poly1305, directional keys | **live** -- every WS connection |
-| E2E  | X3DH + Double Ratchet + ML-KEM-1024 hybrid | **live** -- `/dm` only, not `/msg` |
+| E2E  | X3DH + Double Ratchet + ML-KEM-1024 hybrid | **live** -- `/dm` only, not `/msg`, but the prekey bundle it bootstraps from is unsigned/TOFU (see below) |
 | AUTH | wallet + ENS ownership (`/login`) | **live** |
 | SSH  | 3-hop throwaway init, keys shredded | design only, not run automatically |
 | MEM  | memfd+mlock+F_SEAL_WRITE+mprotect:R | design only, unused by the running daemon |
@@ -126,7 +136,7 @@ etherhive up
 | CRYPT| Kyber-1024 + X25519 hybrid sidecar | `etherhive-crypt` is a simulated stub (the real hybrid crypto is in `/dm`, not this sidecar) |
 | BYTE | Quant1bitLLM per-byte sub-keys | implemented as unauthenticated XOR, not the HKDF+CSPRNG scheme described in SECURITY.md; not used on the live path |
 | MESH | Tailscale/Headscale WireGuard | `etherhive-mesh` is a simulated stub |
-| AUTH | honesty vector (17 fields) | live as a *secondary* signal, not primary auth -- see caveat in SECURITY.md |
+| AUTH | honesty vector (17 fields) | design only -- not implemented in the TUI client; the legacy-TCP `/honesty` handler returns a placeholder, not a signed/verified vector |
 
 Full threat model, with the same live-vs-design distinction: [SECURITY.md](SECURITY.md)
 
