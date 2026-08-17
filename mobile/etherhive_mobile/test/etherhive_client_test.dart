@@ -53,4 +53,46 @@ void main() {
     await alice.disconnect();
     await bob.disconnect();
   }, timeout: const Timeout(Duration(seconds: 30)));
+
+  test('rapid back-to-back frames are all delivered, not silently dropped', () async {
+    // Regression test: decryptMessage reads _recvCounter, awaits the actual
+    // decrypt, then advances it -- two frames arriving before either
+    // finishes used to race on that read, so the second always decrypted
+    // against the wrong nonce and was dropped as an auth failure. Fixed by
+    // chaining frame processing instead of firing it off unawaited.
+    final alice = EtherhiveClient();
+    final bob = EtherhiveClient();
+
+    await alice.connect(_wsUrl);
+    expect(alice.status, ConnectionStatus.connected, reason: alice.errorMessage ?? '');
+    await bob.connect(_wsUrl);
+    expect(bob.status, ConnectionStatus.connected, reason: bob.errorMessage ?? '');
+
+    const room = '#flutter-race-test';
+    await alice.joinRoom(room);
+    await _waitUntil(() => alice.messages.any((m) => m.label == '***' && m.body.contains('joined $room')));
+    await bob.joinRoom(room);
+    await _waitUntil(() => bob.messages.any((m) => m.label == '***' && m.body.contains('joined $room')));
+
+    // Fire N sends without awaiting the network round-trip between them, so
+    // their encrypted frames land on bob's socket back-to-back. Kept under
+    // the server's rate-limiter burst (10 tokens, refills at 5/sec) --
+    // this test is isolating the client-side receive race, not the
+    // server's throttling, which would otherwise silently drop the excess
+    // and fail this test for an unrelated reason.
+    const n = 8;
+    final sends = <Future<void>>[];
+    for (var i = 0; i < n; i++) {
+      sends.add(alice.sendRoomText('msg-$i'));
+    }
+    await Future.wait(sends);
+
+    await _waitUntil(
+      () => List.generate(n, (i) => 'msg-$i').every((body) => bob.messages.any((m) => m.body == body)),
+      timeout: const Duration(seconds: 15),
+    );
+
+    await alice.disconnect();
+    await bob.disconnect();
+  }, timeout: const Timeout(Duration(seconds: 30)));
 }

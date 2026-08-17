@@ -102,15 +102,37 @@ class EtherhiveClient extends ChangeNotifier {
     } catch (e) {
       status = ConnectionStatus.error;
       errorMessage = _cleanError(e);
-      notifyListeners();
+      // A failure here can happen after `_channel` is set but before
+      // `_subscription` is assigned (any throw during the handshake, e.g. a
+      // timeout or a bad welcome) -- without closing `_channel` too, the
+      // socket and the server-side peer stay alive, and a retry would
+      // overwrite the reference without ever cleaning up the leaked one.
       await _subscription?.cancel();
       _subscription = null;
+      // Best-effort: if the failure happened before the socket ever finished
+      // connecting (e.g. connection refused), there's nothing real to close
+      // and some implementations never resolve that close() -- bound it so
+      // a doomed cleanup can't hang the whole error path.
+      try {
+        await _channel?.sink.close().timeout(const Duration(seconds: 2));
+      } catch (_) {}
+      _channel = null;
+      _session = null;
+      notifyListeners();
     }
   }
 
+  // Chains each incoming frame's processing onto the previous one instead
+  // of letting the stream listener fire `_handleEncryptedText` fire-and-forget
+  // for every event -- that let two frames arriving back-to-back both read
+  // `_recvCounter` before either had advanced it, so the second one always
+  // decrypted against the wrong nonce and got silently dropped as an auth
+  // failure. This guarantees decryptMessage calls never overlap.
+  Future<void> _processingChain = Future.value();
+
   void _onRawEvent(dynamic event) {
     if (event is String) {
-      _handleEncryptedText(event);
+      _processingChain = _processingChain.then((_) => _handleEncryptedText(event));
     }
     // Binary frames after the handshake aren't part of this protocol; ignore.
   }
@@ -155,33 +177,54 @@ class EtherhiveClient extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _send(Message msg) async {
+  /// Returns whether the frame was actually written to the socket -- callers
+  /// must not show a local echo (or otherwise assume the message went out)
+  /// when this is false. `false` just means "not connected"; it is not
+  /// itself surfaced as an error since disconnects already report through
+  /// `_onDone`/`_onError`.
+  Future<bool> _send(Message msg) async {
     final channel = _channel;
     final session = _session;
-    if (channel == null || session == null || status != ConnectionStatus.connected) return;
+    if (channel == null || session == null || status != ConnectionStatus.connected) return false;
     _seq += 1;
     final frame = await encodeEncrypted(msg, session, 'etherhive-mobile', _seq);
     channel.sink.add(frame);
+    return true;
   }
 
   Future<void> sendRoomText(String body) async {
     if (body.trim().isEmpty) return;
-    await _send(TextMessage(from: '', room: currentRoom, body: body));
-    messages.add(ChatEntry('[$currentRoom] <you>', body, isSelf: true));
+    final sent = await _send(TextMessage(from: '', room: currentRoom, body: body));
+    if (sent) {
+      messages.add(ChatEntry('[$currentRoom] <you>', body, isSelf: true));
+    } else {
+      messages.add(ChatEntry('***', 'not sent -- not connected'));
+    }
     notifyListeners();
   }
 
   Future<void> sendDm(String target, String body) async {
     if (target.trim().isEmpty || body.trim().isEmpty) return;
-    await _send(DmMessage(from: '', to: target, body: body));
-    messages.add(ChatEntry('[msg to $target]', body, isSelf: true));
+    final sent = await _send(DmMessage(from: '', to: target, body: body));
+    if (sent) {
+      messages.add(ChatEntry('[msg to $target]', body, isSelf: true));
+    } else {
+      messages.add(ChatEntry('***', 'not sent -- not connected'));
+    }
     notifyListeners();
   }
 
   Future<void> joinRoom(String room) async {
     if (room.trim().isEmpty) return;
+    final previousRoom = currentRoom;
     currentRoom = room;
-    await _send(JoinMessage(from: '', room: room));
+    final sent = await _send(JoinMessage(from: '', room: room));
+    if (!sent) {
+      // Don't leave the client claiming to be in a room the server was
+      // never told about.
+      currentRoom = previousRoom;
+      messages.add(ChatEntry('***', 'could not join $room -- not connected'));
+    }
     notifyListeners();
   }
 
