@@ -60,12 +60,37 @@ pub enum RatchetError {
 }
 
 /// What a peer publishes so others can start a session with them.
+///
+/// `signature` is optional and *not* itself sufficient to trust the
+/// bundle — it only proves the bundle was published by whoever holds the
+/// wallet key that produced it. A verifier still needs some independent
+/// reason to trust *that wallet* (e.g. it matches an ENS name they logged
+/// in as). Without a signature at all, accepting the bundle is the same
+/// TOFU trust `accept_trust_on_first_use` already documents.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreKeyBundle {
     pub identity_key: Curve25519PublicKey,
     pub one_time_key: Curve25519PublicKey,
     /// ML-KEM-1024 encapsulation (public) key for the hybrid PQ layer.
     pub kem_public_key: Vec<u8>,
+    /// EIP-191 signature over `signing_bytes()`, by the publisher's wallet.
+    /// `None` for bundles published before this existed, or by a client
+    /// that chose not to sign.
+    pub signature: Option<Vec<u8>>,
+}
+
+impl PreKeyBundle {
+    /// The exact bytes a wallet signs to attest to this bundle. Signer and
+    /// verifier must agree on this layout — it's the single source of
+    /// truth for both sides, deliberately kept as one function rather than
+    /// duplicated inline at each call site.
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(32 + 32 + self.kem_public_key.len());
+        msg.extend_from_slice(self.identity_key.as_bytes());
+        msg.extend_from_slice(self.one_time_key.as_bytes());
+        msg.extend_from_slice(&self.kem_public_key);
+        msg
+    }
 }
 
 /// One wire message. `kem_ciphertext` is `Some` only on the first message
@@ -85,6 +110,13 @@ pub struct RatchetIdentity {
 }
 
 impl RatchetIdentity {
+    /// Our own long-term Curve25519 identity key — the same one published
+    /// in `prekey_bundle()`. Needed by the caller to compute a mutual
+    /// `RatchetSession::safety_number`.
+    pub fn identity_key(&self) -> Curve25519PublicKey {
+        self.account.curve25519_key()
+    }
+
     /// Generate a fresh identity with one one-time prekey ready to publish.
     pub fn generate() -> Self {
         let mut account = Account::new();
@@ -105,6 +137,9 @@ impl RatchetIdentity {
             identity_key: self.account.curve25519_key(),
             one_time_key,
             kem_public_key: self.kem.public_key.clone(),
+            // This module has no notion of a wallet identity to sign with —
+            // the caller (the client, which does) signs before publishing.
+            signature: None,
         }
     }
 
@@ -130,7 +165,13 @@ impl RatchetIdentity {
         let (init_to_resp, resp_to_init) = derive_directional_keys(&kem_shared_secret);
 
         // We're the initiator: we send on init_to_resp, receive on resp_to_init.
-        let mut session = RatchetSession { olm, send_key: init_to_resp, recv_key: resp_to_init, send_seq: 0 };
+        let mut session = RatchetSession {
+            olm,
+            send_key: init_to_resp,
+            recv_key: resp_to_init,
+            send_seq: 0,
+            peer_identity_key: bundle.identity_key,
+        };
         let wire = session.encrypt_inner(plaintext, Some(kem_ciphertext))?;
         Ok((session, wire))
     }
@@ -157,7 +198,13 @@ impl RatchetIdentity {
         // resp_to_init, receive on init_to_resp. Using the same key the
         // initiator sent this first message on to receive it, and a
         // different key than we're about to reply with.
-        let session = RatchetSession { olm: result.session, send_key: resp_to_init, recv_key: init_to_resp, send_seq: 0 };
+        let session = RatchetSession {
+            olm: result.session,
+            send_key: resp_to_init,
+            recv_key: init_to_resp,
+            send_seq: 0,
+            peer_identity_key: their_identity_key,
+        };
         let plaintext = unwrap_hybrid_layer(&init_to_resp, &result.plaintext, wire.seq)
             .ok_or(RatchetError::HybridAuthFailed)?;
         Ok((session, plaintext))
@@ -197,9 +244,38 @@ pub struct RatchetSession {
     send_key: [u8; 32],
     recv_key: [u8; 32],
     send_seq: u64,
+    peer_identity_key: Curve25519PublicKey,
 }
 
 impl RatchetSession {
+    /// A short, human-comparable fingerprint of *both* parties' identity
+    /// keys — a safety number in the Signal/WhatsApp/Matrix sense. Takes
+    /// `our_identity_key` (from `RatchetIdentity::identity_key()`) because
+    /// a session only stores the peer's key; the two keys are hashed in
+    /// sorted (not send/receive) order so both sides compute the exact
+    /// same string regardless of who initiated. Session bootstrap here is
+    /// TOFU (see `accept_trust_on_first_use`); this is the manual
+    /// verification path that TOFU alone doesn't provide — two people can
+    /// read this out to each other (call, in person, a channel they
+    /// already trust) and confirm they match.
+    pub fn safety_number(&self, our_identity_key: Curve25519PublicKey) -> String {
+        use sha2::{Digest, Sha256};
+        let mut keys = [our_identity_key.to_bytes(), self.peer_identity_key.to_bytes()];
+        keys.sort();
+        let mut hasher = Sha256::new();
+        hasher.update(keys[0]);
+        hasher.update(keys[1]);
+        let digest = hasher.finalize();
+        digest[..16]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .chunks(2)
+            .map(|c| c.join(""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Encrypt the next message in this (already-established) session.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<RatchetWireMessage, RatchetError> {
         self.encrypt_inner(plaintext, None)
@@ -397,5 +473,45 @@ mod tests {
         // Reusing the same (now-consumed) bundle for a second session must fail.
         let (_mallory_session, wire_m) = mallory.initiate(&bob_bundle, b"replay").unwrap();
         assert!(bob.accept(mallory.account.curve25519_key(), &wire_m).is_err());
+    }
+
+    #[test]
+    fn signed_bundle_verifies_and_tampering_is_detected() {
+        use etherhive_auth::alloy::signers::SignerSync;
+        use etherhive_auth::Identity as WalletIdentity;
+
+        let bob = RatchetIdentity::generate();
+        let mut bundle = bob.prekey_bundle();
+        let wallet = WalletIdentity::generate();
+        let sig = wallet.signer().sign_message_sync(&bundle.signing_bytes()).unwrap();
+        bundle.signature = Some(sig.as_bytes().to_vec());
+
+        // The signature must recover to the wallet that actually signed.
+        let recovered = sig.recover_address_from_msg(bundle.signing_bytes()).unwrap();
+        assert_eq!(recovered, wallet.address());
+
+        // Tampering with any signed field (here: the KEM public key, as an
+        // active MITM substituting its own bundle would have to) must make
+        // the recovered address diverge from what was actually signed --
+        // proving the signature binds to bundle *content*, not just
+        // floating alongside it unchecked.
+        let mut tampered = bundle.clone();
+        tampered.kem_public_key[0] ^= 0xFF;
+        let recovered_tampered = sig.recover_address_from_msg(tampered.signing_bytes()).unwrap();
+        assert_ne!(recovered_tampered, wallet.address());
+    }
+
+    #[test]
+    fn safety_number_matches_on_both_sides() {
+        let alice = RatchetIdentity::generate();
+        let mut bob = RatchetIdentity::generate();
+        let bundle = bob.prekey_bundle();
+
+        let (session_a, wire) = alice.initiate(&bundle, b"hi").unwrap();
+        let (session_b, _) = bob.accept(alice.account.curve25519_key(), &wire).unwrap();
+
+        let from_alice = session_a.safety_number(alice.identity_key());
+        let from_bob = session_b.safety_number(bob.identity_key());
+        assert_eq!(from_alice, from_bob, "both sides must compute the identical safety number");
     }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -33,17 +34,42 @@ type PrekeyBundles = Arc<Mutex<HashMap<String, PreKeyBundle>>>;
 /// (ephemeral, un-walleted-default) peer_id — ULTRAPLAN phase 3 "shared
 /// login". Un-walleted connections are unaffected; this is additive.
 type AuthenticatedNames = Arc<Mutex<HashMap<String, String>>>;
+/// peer_id -> (uuid, ens_name, issued_at). Populated by
+/// `AuthChallengeRequest`, consumed (removed) by a matching `AuthLogin` --
+/// this is what closes the gap `etherhive_auth::auth::verify_challenge`'s
+/// own doc comment flags: the crate is stateless and can verify a
+/// signature is fresh and correct, but only the caller can refuse to
+/// accept the *same* valid signature twice. Keyed by peer_id rather than
+/// uuid so a connection can only ever have one pending challenge at a
+/// time -- a new request replaces the old one instead of adding another
+/// entry, which bounds this map to "one entry per currently-connected
+/// peer" instead of growing with every request a peer ever sends. Removed
+/// outright on disconnect, same as ws_peers/authenticated_names/the rate
+/// limiter.
+type PendingChallenges = Arc<Mutex<HashMap<String, (Uuid, String, u64)>>>;
 type WsSink = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, WsMessage>;
 
-/// How long an AuthLogin challenge's timestamp stays within the replay
-/// window (see etherhive_auth::auth::verify_challenge's own caveat: this
-/// bounds how long a captured signature stays replayable, not full replay
-/// prevention within the window).
+/// How long a server-issued AuthChallenge stays redeemable, and (per
+/// `verify_challenge`) how far its timestamp may drift from "now". Combined
+/// with `PendingChallenges` consuming the uuid on first use, a captured
+/// `(challenge, signature)` pair is no longer replayable at all -- not just
+/// bounded to this window.
 const AUTH_MAX_AGE_SECS: u64 = 300;
+
+/// Real ENS names are well under this (253 is the classic DNS full-name
+/// length cap). Rejected outright rather than truncated, so an
+/// `AuthChallengeRequest` can't be used to stash an arbitrarily large
+/// string in `PendingChallenges`.
+const MAX_ENS_NAME_LEN: usize = 253;
 
 /// Default RPC endpoint for ENS ownership lookups — a public node, no API
 /// key needed. Override with a 3rd CLI arg for production use.
 const DEFAULT_RPC_URL: &str = "https://ethereum-rpc.publicnode.com";
+
+/// Hard cap on one WS text frame, checked before decrypting or parsing it.
+/// The biggest legitimate payload (a PrekeyBundlePublish carrying an
+/// ML-KEM-1024 public key, base64'd + JSON-wrapped) is under a few KB.
+const MAX_WS_FRAME_BYTES: usize = 65536;
 
 #[tokio::main]
 async fn main() {
@@ -71,6 +97,7 @@ async fn main() {
     let ws_peers: WsPeers = Arc::new(Mutex::new(HashMap::new()));
     let prekey_bundles: PrekeyBundles = Arc::new(Mutex::new(HashMap::new()));
     let authenticated_names: AuthenticatedNames = Arc::new(Mutex::new(HashMap::new()));
+    let pending_challenges: PendingChallenges = Arc::new(Mutex::new(HashMap::new()));
 
     eprintln!("etherhive-ircd v2.1 :: quantum-proof messaging");
     eprintln!("  legacy TCP  (plaintext, back-compat) :: 127.0.0.1:{}", port);
@@ -96,6 +123,7 @@ async fn main() {
         ws_peers.clone(),
         prekey_bundles.clone(),
         authenticated_names.clone(),
+        pending_challenges.clone(),
         rpc_url.clone(),
     ));
 
@@ -335,6 +363,7 @@ async fn run_ws_listener(
     ws_peers: WsPeers,
     prekey_bundles: PrekeyBundles,
     authenticated_names: AuthenticatedNames,
+    pending_challenges: PendingChallenges,
     rpc_url: Arc<str>,
 ) {
     let addr = format!("127.0.0.1:{}", port);
@@ -352,6 +381,7 @@ async fn run_ws_listener(
             ws_peers.clone(),
             prekey_bundles.clone(),
             authenticated_names.clone(),
+            pending_challenges.clone(),
             rpc_url.clone(),
         ));
     }
@@ -371,6 +401,7 @@ async fn handle_ws_client(
     ws_peers: WsPeers,
     prekey_bundles: PrekeyBundles,
     authenticated_names: AuthenticatedNames,
+    pending_challenges: PendingChallenges,
     rpc_url: Arc<str>,
 ) {
     let addr: SocketAddr = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
@@ -417,9 +448,14 @@ async fn handle_ws_client(
             incoming = read.next() => {
                 match incoming {
                     Some(Ok(WsMessage::Text(text))) => {
+                        // Reject oversized frames before decrypting/parsing --
+                        // the biggest legitimate payload (a PrekeyBundlePublish
+                        // carrying an ML-KEM-1024 public key) is under a few KB;
+                        // this is generous headroom, not a tight fit.
+                        if text.len() > MAX_WS_FRAME_BYTES { continue; }
                         if !rl.lock().unwrap().allow(&peer_id) { continue; }
                         let Some(msg) = decode_encrypted(&text, &mut session) else { continue };
-                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &authenticated_names, &rpc_url, &mut write, &mut session, &mut seq).await;
+                        handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &authenticated_names, &pending_challenges, &rpc_url, &mut write, &mut session, &mut seq).await;
                     }
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Err(_)) => break,
@@ -429,8 +465,11 @@ async fn handle_ws_client(
         }
     }
 
+    rl.lock().unwrap().remove(&peer_id);
+
     ws_peers.lock().unwrap().remove(&peer_id);
     authenticated_names.lock().unwrap().retain(|_, v| v != &peer_id);
+    pending_challenges.lock().unwrap().remove(&peer_id);
 }
 
 /// Dispatch one decrypted `Message` from a WS peer. The sender's `from` field
@@ -444,6 +483,7 @@ async fn handle_ws_message(
     ws_peers: &WsPeers,
     prekey_bundles: &PrekeyBundles,
     authenticated_names: &AuthenticatedNames,
+    pending_challenges: &PendingChallenges,
     rpc_url: &str,
     write: &mut WsSink,
     session: &mut CryptoSession,
@@ -454,22 +494,63 @@ async fn handle_ws_message(
             send_encrypted(write, session, seq, &Message::Pong).await;
         }
 
+        // The server generates the challenge, not the client, and remembers
+        // it as pending-and-single-use -- see PendingChallenges' doc comment.
+        Message::AuthChallengeRequest { ens_name } => {
+            if ens_name.is_empty() || ens_name.len() > MAX_ENS_NAME_LEN {
+                let notice = Message::System { body: "invalid ens_name".to_string() };
+                send_encrypted(write, session, seq, &notice).await;
+                return;
+            }
+            let uuid = Uuid::new_v4();
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            // Keyed by peer_id: this replaces any previous unredeemed
+            // challenge for this connection rather than adding another
+            // entry, so repeatedly requesting can't grow the map.
+            pending_challenges.lock().unwrap().insert(peer_id.to_string(), (uuid, ens_name, timestamp));
+            let resp = Message::AuthChallengeIssued { uuid: uuid.to_string(), timestamp };
+            send_encrypted(write, session, seq, &resp).await;
+        }
+
         // ULTRAPLAN phase 3 "shared login": prove ownership of an ENS name
-        // by signing UUID+timestamp, verified against the name's current
-        // owner. Optional — connections that skip this stay on their
-        // default ephemeral peer_id, which keeps working exactly as before.
+        // by signing a server-issued UUID+timestamp, verified against the
+        // name's current owner. Optional — connections that skip this stay
+        // on their default ephemeral peer_id, which keeps working exactly
+        // as before.
         Message::AuthLogin { ens_name, uuid, timestamp, signature } => {
-            let result = authenticate(rpc_url, &ens_name, &uuid, timestamp, &signature).await;
-            let resp = match result {
-                Ok(()) => {
-                    authenticated_names.lock().unwrap().insert(ens_name.clone(), peer_id.to_string());
-                    Message::AuthLoginResult {
-                        ok: true,
-                        route_id: Some(route_id::from_ens_name(&ens_name)),
-                        error: None,
+            let redeemed = match uuid.parse::<Uuid>() {
+                Ok(parsed) => {
+                    let mut pending = pending_challenges.lock().unwrap();
+                    let matches = matches!(
+                        pending.get(peer_id),
+                        Some((pending_uuid, pending_ens, pending_ts))
+                            if *pending_uuid == parsed && *pending_ens == ens_name && *pending_ts == timestamp
+                    );
+                    if matches {
+                        pending.remove(peer_id);
                     }
+                    matches
                 }
-                Err(e) => Message::AuthLoginResult { ok: false, route_id: None, error: Some(e) },
+                Err(_) => false,
+            };
+            let resp = if !redeemed {
+                Message::AuthLoginResult {
+                    ok: false,
+                    route_id: None,
+                    error: Some("no matching server-issued challenge -- send AuthChallengeRequest first (it may also have expired or already been used)".to_string()),
+                }
+            } else {
+                match authenticate(rpc_url, &ens_name, &uuid, timestamp, &signature).await {
+                    Ok(()) => {
+                        authenticated_names.lock().unwrap().insert(ens_name.clone(), peer_id.to_string());
+                        Message::AuthLoginResult {
+                            ok: true,
+                            route_id: Some(route_id::from_ens_name(&ens_name)),
+                            error: None,
+                        }
+                    }
+                    Err(e) => Message::AuthLoginResult { ok: false, route_id: None, error: Some(e) },
+                }
             };
             send_encrypted(write, session, seq, &resp).await;
         }
@@ -507,6 +588,7 @@ async fn handle_ws_message(
 
         Message::Dm { to, body, .. } => {
             let to = resolve_target(&to, authenticated_names);
+            let body = sanitize_body(&strip_egress(&body));
             history.lock().unwrap().append(peer_id, &body);
             let out = Message::Dm { from: peer_id.to_string(), to: to.clone(), body };
             let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
@@ -518,6 +600,7 @@ async fn handle_ws_message(
         }
 
         Message::Text { room, body, .. } => {
+            let body = sanitize_body(&strip_egress(&body));
             history.lock().unwrap().append(peer_id, &body);
             let members = {
                 let d = daemon.lock().unwrap();
@@ -535,6 +618,11 @@ async fn handle_ws_message(
         }
 
         Message::Join { room, .. } => {
+            let Some(room) = sanitize_room(&room) else {
+                let notice = Message::System { body: "invalid room name".to_string() };
+                send_encrypted(write, session, seq, &notice).await;
+                return;
+            };
             let resp = daemon.lock().unwrap().handle(Message::Join { from: peer_id.to_string(), room });
             if let Some(r) = resp {
                 send_encrypted(write, session, seq, &r).await;
@@ -542,6 +630,7 @@ async fn handle_ws_message(
         }
 
         Message::Leave { room, .. } => {
+            let Some(room) = sanitize_room(&room) else { return };
             let resp = daemon.lock().unwrap().handle(Message::Leave { from: peer_id.to_string(), room });
             if let Some(r) = resp {
                 send_encrypted(write, session, seq, &r).await;

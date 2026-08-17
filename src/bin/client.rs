@@ -18,8 +18,16 @@ use etherhive::crypto::CryptoSession;
 use etherhive::hardening::{sanitize_body, strip_egress};
 use etherhive::irc::{decode_encrypted, encode_encrypted, Message};
 use etherhive::ratchet::{RatchetIdentity, RatchetSession};
+use etherhive_auth::alloy::primitives::{Address, Signature as WalletSignature};
+use etherhive_auth::alloy::providers::ProviderBuilder;
+use etherhive_auth::alloy::signers::SignerSync;
 use etherhive_auth::uuid::Uuid;
 use etherhive_auth::{sign_challenge, AuthChallenge, Identity as WalletIdentity};
+
+/// Public RPC used to independently verify a prekey bundle's signer against
+/// the real on-chain ENS owner (see `verify_and_trust_signer`) -- override
+/// with ETHERHIVE_RPC_URL. Same default etherhive-ircd uses.
+const DEFAULT_RPC_URL: &str = "https://ethereum-rpc.publicnode.com";
 
 type WsRead = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
@@ -32,6 +40,11 @@ struct ClientState {
     wallet_identity: WalletIdentity,
     /// Room plain-text chat is addressed to; changed by `/room`.
     current_room: String,
+    /// target -> the wallet address that signed the first prekey bundle we
+    /// accepted for them. Pin-on-first-use: a *different* signer showing up
+    /// later for the same target is refused, not silently accepted -- see
+    /// `verify_and_trust_signer`.
+    known_bundle_signers: HashMap<String, Address>,
     seq: u64,
 }
 
@@ -52,6 +65,7 @@ async fn main() {
         std::process::exit(1);
     }
     let mnemonic = std::env::var("ETHERHIVE_MNEMONIC").ok();
+    let rpc_url = std::env::var("ETHERHIVE_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC_URL.to_string());
 
     println!("etherhive-client :: connecting to {ws_url}...");
     // This client speaks to whatever relay the user points it at -- a
@@ -110,6 +124,7 @@ async fn main() {
         ratchet_sessions: HashMap::new(),
         wallet_identity,
         current_room: "#general".to_string(),
+        known_bundle_signers: HashMap::new(),
         seq: 0,
     };
 
@@ -130,8 +145,15 @@ async fn main() {
     };
     println!("connected as: {peer_id}");
 
-    // Publish our E2E prekey bundle eagerly — reachable as soon as we're online.
-    let bundle = state.ratchet_identity.prekey_bundle();
+    // Publish our E2E prekey bundle eagerly — reachable as soon as we're
+    // online. Sign it with our wallet key so a receiver has something to
+    // verify beyond blind trust-on-first-use (see PreKeyBundle's doc
+    // comment for what the signature does and doesn't prove).
+    let mut bundle = state.ratchet_identity.prekey_bundle();
+    match state.wallet_identity.signer().sign_message_sync(&bundle.signing_bytes()) {
+        Ok(sig) => bundle.signature = Some(sig.as_bytes().to_vec()),
+        Err(e) => println!("*** warning: could not sign prekey bundle ({e}) -- publishing unsigned"),
+    }
     send(&mut write, &mut session, &mut state.seq, &Message::PrekeyBundlePublish { from: String::new(), bundle })
         .await;
     match read_encrypted(&mut read, &mut session).await {
@@ -154,7 +176,7 @@ async fn main() {
             line = input.next_line() => {
                 match line {
                     Ok(Some(line)) => {
-                        if !handle_command(&line, &peer_id, &mut write, &mut read, &mut session, &mut state).await {
+                        if !handle_command(&line, &peer_id, &rpc_url, &mut write, &mut read, &mut session, &mut state).await {
                             break;
                         }
                     }
@@ -224,6 +246,22 @@ async fn wait_for_bundle(
     }
 }
 
+/// Block until the server's `AuthChallengeIssued` for our `/login` request
+/// arrives, handling (not dropping) anything else in the meantime.
+async fn wait_for_challenge(
+    read: &mut WsRead,
+    session: &mut CryptoSession,
+    state: &mut ClientState,
+) -> Option<(String, u64)> {
+    loop {
+        let msg = read_encrypted(read, session).await?;
+        if let Message::AuthChallengeIssued { uuid, timestamp } = msg {
+            return Some((uuid, timestamp));
+        }
+        handle_incoming(msg, state);
+    }
+}
+
 /// Update session state and print one incoming message to the user.
 fn handle_incoming(msg: Message, state: &mut ClientState) {
     match msg {
@@ -264,6 +302,7 @@ fn handle_incoming(msg: Message, state: &mut ClientState) {
 async fn handle_command(
     line: &str,
     peer_id: &str,
+    rpc_url: &str,
     write: &mut WsWrite,
     read: &mut WsRead,
     session: &mut CryptoSession,
@@ -285,6 +324,7 @@ async fn handle_command(
                  <text>              send to the current room ({} right now)\n\
                  /msg <peer> <text>  transport-encrypted DM (server can see it)\n\
                  /dm <target> <text> real E2E DM (ratchet) — target: peer_id or ENS name\n\
+                 /safety <target>    show the safety number for an established E2E session\n\
                  /login <ens.eth>    prove wallet ownership of an ENS name (shared login)\n\
                  /whoami             show my peer_id and wallet address\n\
                  /help               this help\n\
@@ -308,8 +348,22 @@ async fn handle_command(
                 println!("usage: /login <name.eth>");
                 return true;
             };
-            let uuid = Uuid::new_v4();
-            let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            // The server issues the challenge (not us) and only accepts it
+            // once -- signing a self-chosen uuid+timestamp would be
+            // replayable by anyone who captured the signature.
+            let request = Message::AuthChallengeRequest { ens_name: ens_name.to_string() };
+            send(write, session, &mut state.seq, &request).await;
+            let Some((uuid, timestamp)) = wait_for_challenge(read, session, state).await else {
+                println!("*** login failed: no challenge from server (connection closed?)");
+                return true;
+            };
+            let uuid: Uuid = match uuid.parse() {
+                Ok(u) => u,
+                Err(e) => {
+                    println!("*** login failed: server sent an invalid uuid: {e}");
+                    return true;
+                }
+            };
             let challenge = AuthChallenge { uuid, timestamp };
             let signature = match sign_challenge(&state.wallet_identity, &challenge) {
                 Ok(sig) => sig,
@@ -344,7 +398,21 @@ async fn handle_command(
                 println!("usage: /dm <target> <text>");
                 return true;
             };
-            send_e2e(write, read, session, state, target, body).await;
+            send_e2e(write, read, session, state, rpc_url, target, body).await;
+        }
+
+        "/safety" => {
+            let Some(target) = parts.get(1) else {
+                println!("usage: /safety <target>");
+                return true;
+            };
+            match state.ratchet_sessions.get(*target) {
+                Some(existing) => {
+                    let ours = state.ratchet_identity.identity_key();
+                    println!("safety number for {target}: {}", existing.safety_number(ours));
+                }
+                None => println!("*** no established E2E session with {target} yet -- /dm them first"),
+            }
         }
 
         _ if line.starts_with('/') => {
@@ -367,6 +435,76 @@ fn split_target(rest: &str) -> Option<(&str, &str)> {
     if target.is_empty() || body.is_empty() { None } else { Some((target, body)) }
 }
 
+/// Decide whether to trust `recovered` (the wallet that signed `target`'s
+/// prekey bundle) before using it to bootstrap an E2E session. A
+/// recoverable signature alone proves nothing on its own -- a malicious
+/// relay can generate its own wallet and sign its own substituted bundle
+/// exactly as easily as a real peer signs a real one. Two paths to real
+/// trust:
+///
+/// - `target` looks like an ENS name (`*.eth`): resolve its current owner
+///   ourselves, directly against the RPC, never through the (possibly
+///   hostile) relay -- and require an exact match. This is the strong
+///   case: independent, on-chain, not just "a signature exists."
+/// - Otherwise (a raw peer_id, with no independent authority to check
+///   against): pin-on-first-use. The first signer seen for a given target
+///   is remembered; a *different* signer showing up later for the same
+///   target is refused, not silently accepted -- the same "identity
+///   changed" signal SSH/Signal give for exactly this reason. This does
+///   not stop a MITM on the very first contact (nothing but real PKI
+///   does), but it does turn a changed identity into a loud refusal
+///   instead of a silent compromise.
+async fn verify_and_trust_signer(rpc_url: &str, state: &mut ClientState, target: &str, recovered: Address) -> bool {
+    if target.ends_with(".eth") {
+        let parsed_url = match rpc_url.parse() {
+            Ok(u) => u,
+            Err(e) => {
+                println!("*** invalid ETHERHIVE_RPC_URL ({e}) -- cannot independently verify {target}, refusing");
+                return false;
+            }
+        };
+        let provider = ProviderBuilder::new().connect_http(parsed_url);
+        println!("*** resolving {target}'s on-chain ENS owner to verify its prekey bundle...");
+        return match etherhive_auth::resolve_owner(&provider, target).await {
+            Ok(owner) if owner == recovered => {
+                println!("*** {target}'s prekey bundle is signed by its verified ENS owner {recovered:#x}");
+                true
+            }
+            Ok(owner) => {
+                println!(
+                    "*** REFUSING: {target}'s prekey bundle is signed by {recovered:#x}, but its current ENS owner is {owner:#x} -- possible active MITM. Not sending."
+                );
+                false
+            }
+            Err(e) => {
+                println!("*** could not independently resolve {target}'s ENS owner ({e}) -- falling back to pin-on-first-use trust");
+                pin_and_check(state, target, recovered)
+            }
+        };
+    }
+    pin_and_check(state, target, recovered)
+}
+
+fn pin_and_check(state: &mut ClientState, target: &str, recovered: Address) -> bool {
+    match state.known_bundle_signers.get(target) {
+        Some(pinned) if *pinned == recovered => {
+            println!("*** {target}'s prekey bundle matches the previously seen signer {recovered:#x}");
+            true
+        }
+        Some(pinned) => {
+            println!(
+                "*** REFUSING: {target}'s prekey bundle is signed by {recovered:#x}, but a different wallet ({pinned:#x}) signed it before -- possible active MITM or a real identity change. Not sending."
+            );
+            false
+        }
+        None => {
+            println!("*** {target}'s prekey bundle is signed by {recovered:#x} (first contact -- pinned; run /safety {target} to verify out of band)");
+            state.known_bundle_signers.insert(target.to_string(), recovered);
+            true
+        }
+    }
+}
+
 /// Send a real E2E message to `target`, establishing a ratchet session
 /// first (publish/fetch prekey bundles) if one doesn't exist yet.
 async fn send_e2e(
@@ -374,6 +512,7 @@ async fn send_e2e(
     read: &mut WsRead,
     session: &mut CryptoSession,
     state: &mut ClientState,
+    rpc_url: &str,
     target: &str,
     body: &str,
 ) {
@@ -410,6 +549,35 @@ async fn send_e2e(
         }
     };
 
+    match &bundle.signature {
+        Some(sig_bytes) => {
+            let sig = match WalletSignature::try_from(sig_bytes.as_slice()) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    println!("*** {target}'s prekey bundle has a malformed signature ({e}) -- refusing to use it");
+                    return;
+                }
+            };
+            let recovered = match sig.recover_address_from_msg(bundle.signing_bytes()) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    println!("*** {target}'s prekey bundle has an INVALID signature ({e}) -- refusing to use it");
+                    return;
+                }
+            };
+            // A recoverable signature alone proves nothing -- an attacker
+            // relay can generate its own wallet and sign its own
+            // substituted bundle just as easily as a real peer signs a
+            // real one. This must actually check the recovered address
+            // against something independent before we trust it, not just
+            // print it and continue.
+            if !verify_and_trust_signer(rpc_url, state, target, recovered).await {
+                return;
+            }
+        }
+        None => println!("*** {target}'s prekey bundle is unsigned -- trusting via TOFU only; run /safety {target} after this to verify out-of-band"),
+    }
+
     match state.ratchet_identity.initiate(&bundle, body.as_bytes()) {
         Ok((new_session, wire)) => {
             let msg = Message::Ratchet { from: String::new(), to: target.to_string(), wire };
@@ -418,5 +586,56 @@ async fn send_e2e(
             state.ratchet_sessions.insert(target.to_string(), new_session);
         }
         Err(e) => println!("*** session bootstrap failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_state() -> ClientState {
+        ClientState {
+            ratchet_identity: RatchetIdentity::generate(),
+            ratchet_sessions: HashMap::new(),
+            wallet_identity: WalletIdentity::generate(),
+            current_room: "#general".to_string(),
+            known_bundle_signers: HashMap::new(),
+            seq: 0,
+        }
+    }
+
+    /// Regression test for the Codex finding on #6: a recoverable signature
+    /// alone must not be enough to trust a bundle -- pin-on-first-use has
+    /// to actually remember the first signer and refuse a different one
+    /// later, not just print whatever address it recovers.
+    #[test]
+    fn pin_and_check_accepts_first_contact_then_refuses_a_different_signer() {
+        let mut state = fresh_state();
+        let real_signer = WalletIdentity::generate().address();
+        let attacker_signer = WalletIdentity::generate().address();
+
+        // First contact: nothing pinned yet, so this is trusted and pinned.
+        assert!(pin_and_check(&mut state, "some-peer-id:12345", real_signer));
+        assert_eq!(state.known_bundle_signers.get("some-peer-id:12345"), Some(&real_signer));
+
+        // Same signer again: still trusted, pin unchanged.
+        assert!(pin_and_check(&mut state, "some-peer-id:12345", real_signer));
+
+        // A different signer for the SAME target: this is exactly the MITM
+        // scenario Codex flagged -- must be refused, not silently accepted.
+        assert!(!pin_and_check(&mut state, "some-peer-id:12345", attacker_signer));
+        // And the pin must not have been clobbered by the refused attempt.
+        assert_eq!(state.known_bundle_signers.get("some-peer-id:12345"), Some(&real_signer));
+    }
+
+    #[test]
+    fn pin_and_check_is_independent_per_target() {
+        let mut state = fresh_state();
+        let alice = WalletIdentity::generate().address();
+        let bob = WalletIdentity::generate().address();
+
+        assert!(pin_and_check(&mut state, "alice-peer", alice));
+        assert!(pin_and_check(&mut state, "bob-peer", bob));
+        assert_eq!(state.known_bundle_signers.len(), 2);
     }
 }

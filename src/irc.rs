@@ -24,11 +24,20 @@ pub enum Message {
     /// server routes this by `to` alone and never decrypts `wire` — it
     /// holds no ratchet session for it and structurally cannot.
     Ratchet { from: String, to: String, wire: RatchetWireMessage },
+    /// Ask the server to issue a login challenge for `ens_name`. The server
+    /// generates the UUID+timestamp (not the client) and remembers it as
+    /// pending, single-use — this is what makes `AuthLogin` non-replayable
+    /// within the window, not just time-bounded.
+    AuthChallengeRequest { ens_name: String },
+    /// Response to `AuthChallengeRequest`: the server-issued challenge to sign.
+    AuthChallengeIssued { uuid: String, timestamp: u64 },
     /// Prove wallet+ENS identity ownership (ULTRAPLAN phase 3 "shared
     /// login") — Arnacon-compatible: sign UUID+timestamp, the server
     /// verifies against the name's current ENS owner. Optional: connections
     /// that never send this stay on the default ephemeral, un-walleted
-    /// identity, which remains fully supported.
+    /// identity, which remains fully supported. `uuid`+`timestamp` must
+    /// match a still-pending `AuthChallengeIssued` this connection received
+    /// — the server rejects self-chosen or already-consumed values.
     AuthLogin { ens_name: String, uuid: String, timestamp: u64, signature: Vec<u8> },
     /// Response to `AuthLogin`.
     AuthLoginResult { ok: bool, route_id: Option<String>, error: Option<String> },

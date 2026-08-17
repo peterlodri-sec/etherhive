@@ -1,6 +1,14 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// A peer that's gone quiet for this long is assumed disconnected (or was
+/// only ever a one-shot connection) and gets swept from `peers` -- without
+/// this, one HashMap entry accumulates per distinct peer_id forever (and
+/// peer_id is typically `addr:ephemeral_port`, so every new connection
+/// gets its own entry). Callers that know a peer actually disconnected
+/// should still call `remove` for prompt cleanup; this is the backstop.
+const IDLE_EVICT_SECS: f64 = 300.0;
+
 /// Per-peer rate limiter.
 /// Default: 5 messages/second, burst of 10.
 pub struct RateLimiter {
@@ -21,14 +29,21 @@ impl RateLimiter {
 
     /// Check if a peer can send a message. Returns true if allowed.
     pub fn allow(&mut self, peer: &str) -> bool {
+        let now = Instant::now();
+        if !self.peers.contains_key(peer) {
+            // Only sweep when we're about to grow the map -- keeps the
+            // common case (a message from an already-known peer) O(1)
+            // instead of paying an eviction scan on every message.
+            self.peers.retain(|_, limit| now.duration_since(limit.last_check).as_secs_f64() < IDLE_EVICT_SECS);
+        }
+
         let limit = self.peers.entry(peer.to_string()).or_insert(PeerLimit {
             tokens: 10.0, // burst of 10
-            last_check: Instant::now(),
+            last_check: now,
             burst: 10.0,
             rate: 5.0, // 5 msg/sec
         });
 
-        let now = Instant::now();
         let elapsed = now.duration_since(limit.last_check).as_secs_f64();
         limit.tokens = (limit.tokens + elapsed * limit.rate).min(limit.burst);
         limit.last_check = now;
@@ -49,6 +64,13 @@ impl RateLimiter {
             burst,
             rate,
         });
+    }
+
+    /// Drop a peer's state immediately -- call this on disconnect so a
+    /// short-lived connection doesn't wait out `IDLE_EVICT_SECS` before
+    /// its entry is freed.
+    pub fn remove(&mut self, peer: &str) {
+        self.peers.remove(peer);
     }
 }
 
@@ -153,6 +175,19 @@ mod tests {
         let mut rl = RateLimiter::new();
         assert!(rl.allow("alice"));
         assert!(rl.allow("bob"));
+    }
+
+    #[test]
+    fn test_rate_limiter_remove_frees_state_immediately() {
+        let mut rl = RateLimiter::new();
+        for _ in 0..10 {
+            assert!(rl.allow("alice"));
+        }
+        assert!(!rl.allow("alice"), "burst exhausted");
+        rl.remove("alice");
+        // A fresh entry after remove() gets a fresh burst -- proves the
+        // old exhausted state was actually dropped, not just hidden.
+        assert!(rl.allow("alice"));
     }
 
     #[test]

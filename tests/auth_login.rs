@@ -135,10 +135,10 @@ async fn auth_login_against_real_forked_ens_owner() {
     let url = format!("ws://127.0.0.1:{}", ws_port);
     let (mut write, mut read, mut session) = connect_and_handshake(&url).await;
     let _welcome = read_encrypted(&mut read, &mut session).await;
+    let mut seq = 0u64;
 
     // --- Successful login: identity really is vitalik.eth's owner on this fork ---
-    let uuid = Uuid::new_v4();
-    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let (uuid, timestamp) = request_challenge(&mut write, &mut read, &mut session, &mut seq, "vitalik.eth").await;
     let message = format!("{uuid}{timestamp}");
     let signature = identity.signer().sign_message_sync(message.as_bytes()).unwrap();
 
@@ -148,7 +148,8 @@ async fn auth_login_against_real_forked_ens_owner() {
         timestamp,
         signature: signature.as_bytes().to_vec(),
     };
-    send_encrypted(&mut write, &mut session, 1, &login).await;
+    seq += 1;
+    send_encrypted(&mut write, &mut session, seq, &login).await;
 
     let result = read_encrypted(&mut read, &mut session).await;
     match result {
@@ -158,23 +159,70 @@ async fn auth_login_against_real_forked_ens_owner() {
         other => panic!("expected successful AuthLoginResult, got {:?}", other),
     }
 
+    // --- Replay rejected: the exact same (uuid, signature) can't be redeemed twice,
+    // even though it's still well within the timestamp window. ---
+    seq += 1;
+    send_encrypted(&mut write, &mut session, seq, &login).await;
+    let replay_result = read_encrypted(&mut read, &mut session).await;
+    match replay_result {
+        Message::AuthLoginResult { ok: false, route_id: None, error: Some(_) } => {}
+        other => panic!("expected the replayed login to be rejected, got {:?}", other),
+    }
+
     // --- Rejected login: a different wallet is NOT vitalik.eth's owner ---
     let impostor = WalletIdentity::generate();
-    let uuid2 = Uuid::new_v4();
-    let message2 = format!("{uuid2}{timestamp}");
+    let (uuid2, timestamp2) = request_challenge(&mut write, &mut read, &mut session, &mut seq, "vitalik.eth").await;
+    let message2 = format!("{uuid2}{timestamp2}");
     let bad_signature = impostor.signer().sign_message_sync(message2.as_bytes()).unwrap();
 
     let bad_login = Message::AuthLogin {
         ens_name: "vitalik.eth".to_string(),
         uuid: uuid2.to_string(),
-        timestamp,
+        timestamp: timestamp2,
         signature: bad_signature.as_bytes().to_vec(),
     };
-    send_encrypted(&mut write, &mut session, 2, &bad_login).await;
+    seq += 1;
+    send_encrypted(&mut write, &mut session, seq, &bad_login).await;
 
     let result2 = read_encrypted(&mut read, &mut session).await;
     match result2 {
         Message::AuthLoginResult { ok: false, route_id: None, error: Some(_) } => {}
         other => panic!("expected rejected AuthLoginResult, got {:?}", other),
+    }
+
+    // --- Rejected login: a self-chosen (never server-issued) challenge ---
+    let uuid3 = Uuid::new_v4();
+    let timestamp3 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let message3 = format!("{uuid3}{timestamp3}");
+    let self_chosen_signature = identity.signer().sign_message_sync(message3.as_bytes()).unwrap();
+    let self_chosen_login = Message::AuthLogin {
+        ens_name: "vitalik.eth".to_string(),
+        uuid: uuid3.to_string(),
+        timestamp: timestamp3,
+        signature: self_chosen_signature.as_bytes().to_vec(),
+    };
+    seq += 1;
+    send_encrypted(&mut write, &mut session, seq, &self_chosen_login).await;
+    let result3 = read_encrypted(&mut read, &mut session).await;
+    match result3 {
+        Message::AuthLoginResult { ok: false, route_id: None, error: Some(_) } => {}
+        other => panic!("expected a self-chosen (never-issued) challenge to be rejected, got {:?}", other),
+    }
+}
+
+/// Send `AuthChallengeRequest` and wait for the matching `AuthChallengeIssued`.
+async fn request_challenge(
+    write: &mut WsWrite,
+    read: &mut WsRead,
+    session: &mut CryptoSession,
+    seq: &mut u64,
+    ens_name: &str,
+) -> (Uuid, u64) {
+    *seq += 1;
+    let req = Message::AuthChallengeRequest { ens_name: ens_name.to_string() };
+    send_encrypted(write, session, *seq, &req).await;
+    match read_encrypted(read, session).await {
+        Message::AuthChallengeIssued { uuid, timestamp } => (uuid.parse().unwrap(), timestamp),
+        other => panic!("expected AuthChallengeIssued, got {:?}", other),
     }
 }
