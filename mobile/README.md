@@ -45,7 +45,7 @@ a live `etherhive-ircd`, and asserts a real message actually round-trips:
 ```bash
 # terminal 1, from the honest-irc repo root
 cargo build --release --bin etherhive-ircd
-./target/release/etherhive-ircd 19771 19771  # legacy port, ws port
+./target/release/etherhive-ircd 19770 19771  # legacy port, ws port -- must differ
 
 # terminal 2
 cd mobile/etherhive_mobile
