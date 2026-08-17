@@ -395,7 +395,9 @@ async fn handle_ws_client(
         }
         _ => return,
     };
-    session.exchange(&client_pub);
+    if session.exchange(&client_pub, true).is_err() {
+        return;
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     ws_peers.lock().unwrap().insert(peer_id.clone(), tx);

@@ -80,7 +80,7 @@ async fn connect_and_handshake(url: &str) -> (WsWrite, WsRead, CryptoSession) {
     };
     let mut session = CryptoSession::new();
     write.send(WsMessage::Binary(session.public_key_bytes().to_vec())).await.unwrap();
-    session.exchange(&server_pub);
+    session.exchange(&server_pub, false).unwrap();
     (write, read, session)
 }
 
