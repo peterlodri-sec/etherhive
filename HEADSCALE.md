@@ -1,5 +1,13 @@
 # etherhive — Headscale Setup Guide (Roadmap v1.42)
 
+> **Roadmap status:** the `[DONE]` markers below track design/scaffolding
+> milestones, not "wired into the running daemon." In particular
+> `etherhive-mesh` (this doc's subject) is currently a simulated stub that
+> prints success and does nothing — see the "What's actually running"
+> table in [SECURITY.md](SECURITY.md) for the real state of every layer,
+> and [issue #1](https://github.com/peterlodri-sec/etherhive/issues/1) for
+> the audit that found the gap between this roadmap and reality.
+
 ## Overview
 
 etherhive uses Tailscale-compatible mesh networking via the `etherhive-mesh` sidecar.
@@ -253,7 +261,12 @@ headscale preauthkeys create \
 - [x] SPHINCS+ backup signatures (SLH-DSA-SHAKE-256s)
 - [x] Hybrid PQC bundle generation
 - [x] Trust Model separated from Threat Model
-- [x] All 7 security audit findings resolved
+- [ ] ~~All 7 security audit findings resolved~~ -- false when written; a later
+      external audit ([#1](https://github.com/peterlodri-sec/etherhive/issues/1))
+      found 15 real findings, including a critical transport nonce-reuse bug
+      (fixed in [#2](https://github.com/peterlodri-sec/etherhive/pull/2)).
+      The PQC primitives listed above are real; that's separate from "all
+      findings resolved."
 
 ### v0.7.0 — Search & Discovery [DONE]
 - [x] `/search <term>` — search all public group history (full-text)
@@ -271,7 +284,10 @@ headscale preauthkeys create \
 - [x] UPX compression + hardened build flags
 - [x] Zero external integration, ASCII wire protocol, UTF-8 messages
 - [x] Trust Model separated from Threat Model
-- [x] All 7 security audit findings resolved
+- [ ] ~~All 7 security audit findings resolved~~ -- see the v0.6.0 correction
+      above; the sidecar binaries this milestone counts (`etherhive-vpn`,
+      `etherhive-crypt`, `etherhive-mesh`) are simulated stubs, not the
+      "Production Mesh" the title claims.
 
 ### v1.42 — The Answer
 - [ ] .onion / I2P overlay (Tor hidden service for etherhive)
@@ -282,13 +298,20 @@ headscale preauthkeys create \
 - [ ] Full nix-base fleet integration: deploy etherhive on dev-cx53, hetzner, public-services-host
 - [ ] music.vaked.dev "listening together" — synchronized playback across peers
 
-### v2.1 — Recursive Quant-Proof + Stabilization [DONE]
+### v2.1 — Recursive Quant-Proof + Stabilization [DONE, with corrections]
 - [x] Constant-time operations (ct_eq, ct_select on all sensitive paths)
-- [x] Recursive encryption: n-layer XOR with derived key chain
-- [x] Input sanitization: room names, message bodies, URL stripping
+- [ ] ~~Recursive encryption: n-layer XOR with derived key chain~~ -- `RecursiveEncryptor`
+      is a many-time pad (linear repeating-key XOR, no nonce, no MAC); extra
+      layers don't add real security. Not on the live message path.
+- [ ] ~~Input sanitization: room names, message bodies, URL stripping~~ -- these
+      sanitizers exist (`src/hardening.rs`) but the WebSocket path (the real
+      transport) never calls them; only the legacy plaintext TCP path does.
 - [x] Zeroize on drop for all keys (SecureBuffer, RecursiveEncryptor)
 - [x] No-panic: SafeResult replaces all unwraps
-- [x] Single entry point for untrusted input (sealed::process_incoming)
+- [ ] ~~Single entry point for untrusted input (sealed::process_incoming)~~ --
+      `hardening::sealed::process_incoming` exists but isn't called from the
+      WS handler, which is the actual "single entry point" in practice.
 - [x] 11 modules, 36 tests, 5 binaries
-- [x] 0 QVEs (Quant Vulnerabilities found)
+- [ ] ~~0 QVEs (Quant Vulnerabilities found)~~ -- false when written; see the
+      v0.6.0 correction and [issue #1](https://github.com/peterlodri-sec/etherhive/issues/1).
 - [x] Full hardening: RELRO + NX + PIE + stripped + anti-debug + UPX
