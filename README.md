@@ -1,3 +1,5 @@
+![EtherHive](assets/hero.png)
+
 # etherhive -- quantum-proof decentralized messaging
 
 > auth via honesty. transport via Mullvad double-hop. crypto via Kyber+X25519.
