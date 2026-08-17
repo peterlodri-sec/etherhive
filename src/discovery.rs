@@ -101,7 +101,7 @@ impl PeerDiscovery {
         }
         let mut out = "peer directory:\n".to_string();
         for (id, (name, hash, _interests)) in &self.peers {
-            let short_hash = &hash[..8.min(hash.len())];
+            let short_hash: String = hash.chars().take(8).collect();
             out.push_str(&format!("  {} :: {} (hash:{})\n", name, id, short_hash));
         }
         out

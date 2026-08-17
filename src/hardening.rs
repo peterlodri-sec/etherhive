@@ -199,7 +199,7 @@ pub mod sealed {
             return Ok(Some("pong".into()));
         }
 
-        Ok(Some(format!("ack: {}", &line[..32.min(line.len())])))
+        Ok(Some(format!("ack: {}", line.chars().take(32).collect::<String>())))
     }
 }
 
