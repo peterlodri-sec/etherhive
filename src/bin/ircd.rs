@@ -56,6 +56,11 @@ const AUTH_MAX_AGE_SECS: u64 = 300;
 /// key needed. Override with a 3rd CLI arg for production use.
 const DEFAULT_RPC_URL: &str = "https://ethereum-rpc.publicnode.com";
 
+/// Hard cap on one WS text frame, checked before decrypting or parsing it.
+/// The biggest legitimate payload (a PrekeyBundlePublish carrying an
+/// ML-KEM-1024 public key, base64'd + JSON-wrapped) is under a few KB.
+const MAX_WS_FRAME_BYTES: usize = 65536;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -433,6 +438,11 @@ async fn handle_ws_client(
             incoming = read.next() => {
                 match incoming {
                     Some(Ok(WsMessage::Text(text))) => {
+                        // Reject oversized frames before decrypting/parsing --
+                        // the biggest legitimate payload (a PrekeyBundlePublish
+                        // carrying an ML-KEM-1024 public key) is under a few KB;
+                        // this is generous headroom, not a tight fit.
+                        if text.len() > MAX_WS_FRAME_BYTES { continue; }
                         if !rl.lock().unwrap().allow(&peer_id) { continue; }
                         let Some(msg) = decode_encrypted(&text, &mut session) else { continue };
                         handle_ws_message(msg, &peer_id, &daemon, &history, &ws_peers, &prekey_bundles, &authenticated_names, &pending_challenges, &rpc_url, &mut write, &mut session, &mut seq).await;
@@ -444,6 +454,8 @@ async fn handle_ws_client(
             }
         }
     }
+
+    rl.lock().unwrap().remove(&peer_id);
 
     ws_peers.lock().unwrap().remove(&peer_id);
     authenticated_names.lock().unwrap().retain(|_, v| v != &peer_id);
@@ -553,6 +565,7 @@ async fn handle_ws_message(
 
         Message::Dm { to, body, .. } => {
             let to = resolve_target(&to, authenticated_names);
+            let body = sanitize_body(&strip_egress(&body));
             history.lock().unwrap().append(peer_id, &body);
             let out = Message::Dm { from: peer_id.to_string(), to: to.clone(), body };
             let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
@@ -564,6 +577,7 @@ async fn handle_ws_message(
         }
 
         Message::Text { room, body, .. } => {
+            let body = sanitize_body(&strip_egress(&body));
             history.lock().unwrap().append(peer_id, &body);
             let members = {
                 let d = daemon.lock().unwrap();
@@ -581,6 +595,11 @@ async fn handle_ws_message(
         }
 
         Message::Join { room, .. } => {
+            let Some(room) = sanitize_room(&room) else {
+                let notice = Message::System { body: "invalid room name".to_string() };
+                send_encrypted(write, session, seq, &notice).await;
+                return;
+            };
             let resp = daemon.lock().unwrap().handle(Message::Join { from: peer_id.to_string(), room });
             if let Some(r) = resp {
                 send_encrypted(write, session, seq, &r).await;
@@ -588,6 +607,7 @@ async fn handle_ws_message(
         }
 
         Message::Leave { room, .. } => {
+            let Some(room) = sanitize_room(&room) else { return };
             let resp = daemon.lock().unwrap().handle(Message::Leave { from: peer_id.to_string(), room });
             if let Some(r) = resp {
                 send_encrypted(write, session, seq, &r).await;
