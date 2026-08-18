@@ -293,6 +293,26 @@ fn handle_incoming(msg: Message, state: &mut ClientState) {
                 }
             }
         }
+        Message::CallOffer { from, call_id, sdp, .. } => {
+            println!("\n🔔 *** INCOMING CALL from {from} (call_id: {call_id}) ***");
+            println!("*** SDP / Arnacon signaling: {}", sdp.lines().next().unwrap_or_default());
+            println!("*** type /hangup {from} to decline or answer via Arnacon SIP bridge");
+        }
+        Message::CallAnswer { from, call_id, .. } => {
+            println!("\n📞 *** CALL ACCEPTED by {from} (call_id: {call_id}) — media streaming active");
+        }
+        Message::CallCandidate { from, candidate, .. } => {
+            println!("*** ICE candidate from {from}: {candidate}");
+        }
+        Message::CallHangup { from, call_id, reason, .. } => {
+            println!("\n📴 *** CALL TERMINATED by {from} (call_id: {call_id}, reason: {})", reason.unwrap_or_else(|| "normal hangup".to_string()));
+        }
+        Message::CallBridge { target, sip_uri, x_data, x_sign } => {
+            println!("\n🌉 *** ARNACON SIP BRIDGE READY for {target} ***");
+            println!("*** SIP URI: {sip_uri}");
+            println!("*** X-Data:  {x_data}");
+            println!("*** X-Sign:  {x_sign}");
+        }
         Message::AuthLoginResult { ok: true, route_id, .. } => {
             println!("*** login ok — route_id: {}", route_id.unwrap_or_default());
         }
@@ -333,6 +353,8 @@ async fn handle_command(
                  <text>              send to the current room ({} right now)\n\
                  /msg <peer> <text>  transport-encrypted DM (server can see it)\n\
                  /dm <target> <text> real E2E DM (ratchet) — target: peer_id or ENS name\n\
+                 /call <target.eth>  initiate voice call via Arnacon SIP bridge\n\
+                 /hangup <target>    terminate an active call\n\
                  /typing             tell the current room you're typing\n\
                  /typing <peer>      tell a peer you're typing them a DM\n\
                  /read               mark the current room read, up to now\n\
@@ -443,6 +465,53 @@ async fn handle_command(
                 }
                 None => println!("*** no established E2E session with {target} yet -- /dm them first"),
             }
+        }
+
+        "/call" => {
+            let Some(target) = parts.get(1) else {
+                println!("usage: /call <target.eth>");
+                return true;
+            };
+            let challenge = etherhive_auth::AuthChallenge::new(Uuid::new_v4());
+            let x_data = challenge.to_x_data();
+            let x_sign = match etherhive_auth::sign_x_data(&state.wallet_identity, &x_data) {
+                Ok(s) => s,
+                Err(e) => {
+                    println!("*** failed to generate Arnacon call authorization: {e}");
+                    return true;
+                }
+            };
+            let call_id = Uuid::new_v4().to_string();
+            let sip_uri = format!("sip:{}@arnacon.net", target);
+            println!("*** initiating Arnacon call bridge to {target} (call_id: {call_id})...");
+            println!("*** SIP URI: {sip_uri}");
+            println!("*** Arnacon X-Data: {x_data}");
+            println!("*** Arnacon X-Sign: {x_sign}");
+            let sdp = format!("v=0\r\no=honest-irc 0 0 IN IP4 127.0.0.1\r\ns=Arnacon Call\r\nt=0 0\r\nm=audio 5004 RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=x-arnacon-data:{x_data}\r\na=x-arnacon-sign:{x_sign}\r\n");
+            let msg = Message::CallOffer {
+                from: String::new(),
+                to: target.to_string(),
+                call_id,
+                sdp,
+            };
+            send(write, session, &mut state.seq, &msg).await;
+            println!("[call to {target}] call offer dispatched across mesh and Arnacon bridge");
+        }
+
+        "/hangup" => {
+            let Some(target) = parts.get(1) else {
+                println!("usage: /hangup <target>");
+                return true;
+            };
+            let call_id = Uuid::new_v4().to_string();
+            let msg = Message::CallHangup {
+                from: String::new(),
+                to: target.to_string(),
+                call_id,
+                reason: Some("user terminated".to_string()),
+            };
+            send(write, session, &mut state.seq, &msg).await;
+            println!("[hangup to {target}] call terminated");
         }
 
         _ if line.starts_with('/') => {

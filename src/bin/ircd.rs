@@ -674,6 +674,49 @@ async fn handle_ws_message(
             }
         }
 
+        Message::CallOffer { to, call_id, sdp, .. } => {
+            let to = resolve_target(&to, authenticated_names);
+            let out = Message::CallOffer { from: peer_id.to_string(), to: to.clone(), call_id, sdp };
+            let target_tx = ws_peers.lock().unwrap().get(&to).cloned();
+            let sent = target_tx.map(|tx| tx.send(out).is_ok()).unwrap_or(false);
+            if !sent {
+                let notice = Message::System { body: format!("no such peer: {}", to) };
+                send_encrypted(write, session, seq, &notice).await;
+            }
+        }
+
+        Message::CallAnswer { to, call_id, sdp, .. } => {
+            let to = resolve_target(&to, authenticated_names);
+            let out = Message::CallAnswer { from: peer_id.to_string(), to: to.clone(), call_id, sdp };
+            if let Some(tx) = ws_peers.lock().unwrap().get(&to) {
+                let _ = tx.send(out);
+            }
+        }
+
+        Message::CallCandidate { to, call_id, candidate, .. } => {
+            let to = resolve_target(&to, authenticated_names);
+            let out = Message::CallCandidate { from: peer_id.to_string(), to: to.clone(), call_id, candidate };
+            if let Some(tx) = ws_peers.lock().unwrap().get(&to) {
+                let _ = tx.send(out);
+            }
+        }
+
+        Message::CallHangup { to, call_id, reason, .. } => {
+            let to = resolve_target(&to, authenticated_names);
+            let out = Message::CallHangup { from: peer_id.to_string(), to: to.clone(), call_id, reason };
+            if let Some(tx) = ws_peers.lock().unwrap().get(&to) {
+                let _ = tx.send(out);
+            }
+        }
+
+        Message::CallBridge { target, sip_uri, x_data, x_sign } => {
+            let to = resolve_target(&target, authenticated_names);
+            let out = Message::CallBridge { target: to.clone(), sip_uri, x_data, x_sign };
+            if let Some(tx) = ws_peers.lock().unwrap().get(&to) {
+                let _ = tx.send(out);
+            }
+        }
+
         Message::Join { room, .. } => {
             let Some(room) = sanitize_room(&room) else {
                 let notice = Message::System { body: "invalid room name".to_string() };

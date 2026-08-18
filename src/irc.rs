@@ -79,6 +79,17 @@ pub enum Message {
     ReadReceipt { from: String, room: String, up_to_timestamp: u64 },
     /// Read receipt for a 1:1 DM.
     ReadReceiptDm { from: String, to: String, up_to_timestamp: u64 },
+    /// Call signaling (ULTRAPLAN phase 3 "text on honest-irc, tap to call on Arnacon"):
+    /// SIP/WebRTC call offer with session description protocol (SDP).
+    CallOffer { from: String, to: String, call_id: String, sdp: String },
+    /// SIP/WebRTC call answer.
+    CallAnswer { from: String, to: String, call_id: String, sdp: String },
+    /// ICE candidate for peer-to-peer media routing.
+    CallCandidate { from: String, to: String, call_id: String, candidate: String },
+    /// Call termination / hangup.
+    CallHangup { from: String, to: String, call_id: String, reason: Option<String> },
+    /// Direct bridge descriptor for Arnacon Kamailio SIP proxy handoff.
+    CallBridge { target: String, sip_uri: String, x_data: String, x_sign: String },
     /// Ping
     Ping,
     /// Pong
