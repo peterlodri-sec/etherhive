@@ -63,15 +63,115 @@ impl SearchIndex {
     }
 }
 
-/// Peer discovery via honesty vector similarity.
+/// 256-bit Node Identifier for Kademlia DHT routing.
+pub type NodeId = [u8; 32];
+
+/// Compute the XOR metric distance between two 256-bit Node IDs.
+pub fn xor_distance(a: &NodeId, b: &NodeId) -> NodeId {
+    let mut dist = [0u8; 32];
+    for i in 0..32 {
+        dist[i] = a[i] ^ b[i];
+    }
+    dist
+}
+
+/// Compute the number of leading zero bits in the XOR distance (bucket index 0..255).
+pub fn leading_zeros(dist: &NodeId) -> usize {
+    let mut count = 0;
+    for byte in dist {
+        if *byte == 0 {
+            count += 8;
+        } else {
+            count += byte.leading_zeros() as usize;
+            break;
+        }
+    }
+    count
+}
+
+/// A DHT Peer entry with contact endpoints, ENS name, and public key bundle hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DhtPeer {
+    pub node_id: NodeId,
+    pub ens_name: String,
+    pub endpoint: String,
+    pub last_seen_secs: u64,
+}
+
+/// Kademlia k-bucket routing table for decentralized peer discovery.
+pub struct KademliaRoutingTable {
+    pub local_id: NodeId,
+    pub k_bucket_size: usize,
+    /// 256 buckets, each holding up to k peers sorted by recency
+    pub buckets: Vec<Vec<DhtPeer>>,
+}
+
+impl KademliaRoutingTable {
+    pub fn new(local_id: NodeId, k_bucket_size: usize) -> Self {
+        KademliaRoutingTable {
+            local_id,
+            k_bucket_size,
+            buckets: vec![Vec::new(); 256],
+        }
+    }
+
+    /// Insert or update a peer in the routing table.
+    pub fn insert(&mut self, peer: DhtPeer) {
+        if peer.node_id == self.local_id {
+            return; // do not insert self
+        }
+        let dist = xor_distance(&self.local_id, &peer.node_id);
+        let lz = leading_zeros(&dist);
+        let bucket_idx = if lz >= 256 { 255 } else { lz };
+
+        let bucket = &mut self.buckets[bucket_idx];
+        if let Some(pos) = bucket.iter().position(|p| p.node_id == peer.node_id) {
+            bucket.remove(pos);
+            bucket.push(peer); // update to most recently seen
+        } else if bucket.len() < self.k_bucket_size {
+            bucket.push(peer);
+        }
+    }
+
+    /// Find the `k` closest peers to a given target `NodeId`.
+    pub fn closest_peers(&self, target: &NodeId, count: usize) -> Vec<DhtPeer> {
+        let mut all_peers: Vec<(NodeId, DhtPeer)> = Vec::new();
+        for bucket in &self.buckets {
+            for peer in bucket {
+                let dist = xor_distance(target, &peer.node_id);
+                all_peers.push((dist, peer.clone()));
+            }
+        }
+        all_peers.sort_by(|a, b| a.0.cmp(&b.0));
+        all_peers.into_iter().take(count).map(|(_, p)| p).collect()
+    }
+
+    /// Total count of peers currently indexed in the routing table.
+    pub fn total_peers(&self) -> usize {
+        self.buckets.iter().map(|b| b.len()).sum()
+    }
+}
+
+/// Peer discovery via honesty vector similarity and Kademlia DHT routing.
 pub struct PeerDiscovery {
     /// route_id -> (display_name, vector_hash, shared_interests)
     pub peers: HashMap<String, (String, String, Vec<String>)>,
+    pub routing_table: Option<KademliaRoutingTable>,
 }
 
 impl PeerDiscovery {
     pub fn new() -> Self {
-        PeerDiscovery { peers: HashMap::new() }
+        PeerDiscovery {
+            peers: HashMap::new(),
+            routing_table: None,
+        }
+    }
+
+    pub fn with_routing_table(local_id: NodeId, k: usize) -> Self {
+        PeerDiscovery {
+            peers: HashMap::new(),
+            routing_table: Some(KademliaRoutingTable::new(local_id, k)),
+        }
     }
 
     /// Register a peer with their honesty vector hash and interests.
@@ -192,5 +292,48 @@ mod tests {
         hist.append("bob", "msg4"); // pushes msg1 out
         assert_eq!(hist.messages.len(), 3);
         assert_eq!(hist.messages[0].2, "msg2");
+    }
+
+    #[test]
+    fn test_kademlia_xor_distance_and_closest_peers() {
+        let mut local_id = [0u8; 32];
+        local_id[31] = 0x01;
+
+        let mut rt = KademliaRoutingTable::new(local_id, 8);
+
+        let mut peer1_id = [0u8; 32];
+        peer1_id[31] = 0x02; // dist = 0x03
+
+        let mut peer2_id = [0u8; 32];
+        peer2_id[31] = 0xFF; // dist = 0xFE
+
+        let mut peer3_id = [0u8; 32];
+        peer3_id[0] = 0x80; // very far
+
+        rt.insert(DhtPeer {
+            node_id: peer1_id,
+            ens_name: "peer1.eth".into(),
+            endpoint: "ws://127.0.0.1:6667".into(),
+            last_seen_secs: 100,
+        });
+        rt.insert(DhtPeer {
+            node_id: peer2_id,
+            ens_name: "peer2.eth".into(),
+            endpoint: "ws://127.0.0.1:6668".into(),
+            last_seen_secs: 101,
+        });
+        rt.insert(DhtPeer {
+            node_id: peer3_id,
+            ens_name: "peer3.eth".into(),
+            endpoint: "ws://127.0.0.1:6669".into(),
+            last_seen_secs: 102,
+        });
+
+        assert_eq!(rt.total_peers(), 3);
+
+        let closest = rt.closest_peers(&local_id, 2);
+        assert_eq!(closest.len(), 2);
+        assert_eq!(closest[0].ens_name, "peer1.eth");
+        assert_eq!(closest[1].ens_name, "peer2.eth");
     }
 }
