@@ -139,7 +139,7 @@ async fn auth_login_against_real_forked_ens_owner() {
 
     // --- Successful login: identity really is vitalik.eth's owner on this fork ---
     let (uuid, timestamp) = request_challenge(&mut write, &mut read, &mut session, &mut seq, "vitalik.eth").await;
-    let message = format!("{uuid}{timestamp}");
+    let message = format!("{uuid}:{timestamp}");
     let signature = identity.signer().sign_message_sync(message.as_bytes()).unwrap();
 
     let login = Message::AuthLogin {
@@ -172,7 +172,7 @@ async fn auth_login_against_real_forked_ens_owner() {
     // --- Rejected login: a different wallet is NOT vitalik.eth's owner ---
     let impostor = WalletIdentity::generate();
     let (uuid2, timestamp2) = request_challenge(&mut write, &mut read, &mut session, &mut seq, "vitalik.eth").await;
-    let message2 = format!("{uuid2}{timestamp2}");
+    let message2 = format!("{uuid2}:{timestamp2}");
     let bad_signature = impostor.signer().sign_message_sync(message2.as_bytes()).unwrap();
 
     let bad_login = Message::AuthLogin {
@@ -193,7 +193,7 @@ async fn auth_login_against_real_forked_ens_owner() {
     // --- Rejected login: a self-chosen (never server-issued) challenge ---
     let uuid3 = Uuid::new_v4();
     let timestamp3 = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let message3 = format!("{uuid3}{timestamp3}");
+    let message3 = format!("{uuid3}:{timestamp3}");
     let self_chosen_signature = identity.signer().sign_message_sync(message3.as_bytes()).unwrap();
     let self_chosen_login = Message::AuthLogin {
         ens_name: "vitalik.eth".to_string(),
